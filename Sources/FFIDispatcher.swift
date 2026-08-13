@@ -11,14 +11,23 @@ import Foundation
 /*
  Offloads synchronous blocking C-FFI / kernel operations to a dedicated GCD queue,
  immediately suspending the Swift task to prevent thread pool starvation.
+
+ IdeviceGateway owns shared adapter and handshake handles. Every operation touching
+ those handles must be serialized so one request cannot invalidate a connection
+ while another request is still using it.
  */
+private let ffiDispatchQueue = DispatchQueue(
+    label: "com.sidestore.minimuxer.idevice-ffi",
+    qos: .default,
+    autoreleaseFrequency: .workItem
+)
+
 @inline(__always)
 internal func withFFIDispatch<T: Sendable>(
-    on queue: DispatchQueue = .global(),
     _ body: @escaping @Sendable () throws -> T
 ) async throws -> T {
     try await withCheckedThrowingContinuation { continuation in
-        queue.async {
+        ffiDispatchQueue.async {
             do {
                 let result = try body()
                 continuation.resume(returning: result)
