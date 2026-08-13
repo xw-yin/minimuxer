@@ -22,6 +22,7 @@ final internal class MinimuxerImpl: MinimuxerAPI {
     private actor State {
         var status: MinimuxerStatus = .stopped
         var mountTask: Task<Bool, Error>? = nil
+        var mountGeneration: UInt = 0
         var lastDocsPath: String? = nil
         
         func with<T>(_ body: (isolated State) throws -> T) rethrows -> T {
@@ -143,25 +144,11 @@ final internal class MinimuxerImpl: MinimuxerAPI {
         }
 
 
-        let activeProtocol: PairingProtocol = isrppairing ? .rppairing : .lockdown
-
-        let ddiMounted: Bool
-        do {
-            ddiMounted = try await runIdeviceCheckingVPN("while checking DDI mount status", fallback: false) {
-                try await isDDIMounted()
-            }
-        } catch let err as MinimuxerError {
-            return .failure(err)
-        }
-
         if isrppairing {
-            guard ddiMounted else {
-                let msg = "dmg=\(ddiMounted) started=\(MuxerService.shared.isListening)"
-                verboseLog("minimuxer not ready (RSD): \(msg)")
-                return .failure(.mount(protocol: activeProtocol, reason: msg))
-            }
             return .success(true)
         }
+
+        let activeProtocol: PairingProtocol = .lockdown
 
         let deviceUDID: String?
         do {
@@ -175,14 +162,10 @@ final internal class MinimuxerImpl: MinimuxerAPI {
         verboseLog(
             "minimuxer status (usbmuxd): " +
             "deviceUDID=\(deviceUDID ?? "nil") " +
-            "dmg=\(ddiMounted) " +
             "started=\(MuxerService.shared.isListening) "
         )
         guard deviceUDID != nil else {
             return .failure(.invalidPairing(protocol: activeProtocol, reason: "Lockdown UDID not found"))
-        }
-        guard ddiMounted else {
-            return .failure(.mount(protocol: activeProtocol, reason: "DeveloperDiskImage is not mounted"))
         }
         guard MuxerService.shared.isListening else {
             return .failure(.muxerNotListening("Usbmuxd fake server is not listening"))
@@ -268,27 +251,21 @@ final internal class MinimuxerImpl: MinimuxerAPI {
         // start our fake usbmuxd server for lockdown protocol based clients if required
         try await restartMuxerServer()
         
-        do {
-            try await mountDDI(docsPath: mountPath)
-        } catch {
-            debugLog("[minimuxer] WARN: Initial DDI mount skipped during startup: \(error.localizedDescription)")
-        }
-        // mark ready!
+        // DDI is only required by debug/JIT. Make refresh/install available first.
         await state.with{
             $0.status = .started
         }
+        await prewarmDDI(docsPath: mountPath)
     }
 
     func stop() async {
         // actor serialization scope
-        let oldTask = await state.with { state -> Task<Bool, Error>? in
-            state.status = .inprogress  // mark inprogress
-            let task = state.mountTask
-            task?.cancel()              // cancel the task
+        await state.with { state in
+            state.status = .inprogress
+            state.mountTask?.cancel()
+            state.mountGeneration &+= 1
             state.mountTask = nil
-            return task
         }
-        _ = await oldTask?.result       // await cancelled mount task completion
         await MuxerService.shared.stop()
         // mark ready!
         await state.with {
@@ -364,28 +341,82 @@ final internal class MinimuxerImpl: MinimuxerAPI {
             throw MinimuxerError.mount(protocol: activeProtocol, reason: "DDI mount path not set")
         }
         verboseLog("[minimuxer] DDI not mounted, mounting now before launching debug session...")
-        try await Mounter.shared.mount(docsPath: mountPath)
+        let (generation, task) = await makeDDIMountTask(
+            docsPath: mountPath,
+            priority: .userInitiated
+        )
+        do {
+            _ = try await task.value
+            await clearDDIMountTask(generation: generation)
+        } catch {
+            await clearDDIMountTask(generation: generation)
+            throw error
+        }
     }
 
     
     @discardableResult
     func mountDDI(docsPath: String) async throws -> Bool {
-        // actor serialization scope
-        let oldTask = await state.with { state -> Task<Bool, Error>? in
-            state.lastDocsPath = docsPath   // record the mountPath
-            let task = state.mountTask
-            task?.cancel()                  // cancel the task
-            state.mountTask = nil
-            return task
+        let (generation, task) = await makeDDIMountTask(
+            docsPath: docsPath,
+            priority: .medium,
+            replacingExisting: true
+        )
+        do {
+            let result = try await task.value
+            await clearDDIMountTask(generation: generation)
+            return result
+        } catch {
+            await clearDDIMountTask(generation: generation)
+            throw error
         }
-        _ = await oldTask?.result           // await cancelled mount task completion
-        let task = Task.detached(priority: .medium) {
-            try await Mounter.shared.mount(docsPath: docsPath)
+    }
+
+    private func prewarmDDI(docsPath: String) async {
+        let (generation, task) = await makeDDIMountTask(
+            docsPath: docsPath,
+            priority: .utility
+        )
+        Task { [weak self] in
+            do {
+                _ = try await task.value
+                verboseLog("[minimuxer] DDI prewarm completed")
+            } catch is CancellationError {
+                verboseLog("[minimuxer] DDI prewarm cancelled")
+            } catch {
+                debugLog("[minimuxer] WARN: DDI prewarm skipped: \(error.localizedDescription)")
+            }
+            await self?.clearDDIMountTask(generation: generation)
         }
+    }
+
+    private func makeDDIMountTask(
+        docsPath: String,
+        priority: TaskPriority,
+        replacingExisting: Bool = false
+    ) async -> (UInt, Task<Bool, Error>) {
         await state.with {
+            $0.lastDocsPath = docsPath
+            if !replacingExisting, let task = $0.mountTask {
+                return ($0.mountGeneration, task)
+            }
+
+            $0.mountTask?.cancel()
+            $0.mountGeneration &+= 1
+            let generation = $0.mountGeneration
+            let task = Task.detached(priority: priority) {
+                try await Mounter.shared.mount(docsPath: docsPath)
+            }
             $0.mountTask = task
+            return (generation, task)
         }
-        return try await task.value
+    }
+
+    private func clearDDIMountTask(generation: UInt) async {
+        await state.with {
+            guard $0.mountGeneration == generation else { return }
+            $0.mountTask = nil
+        }
     }
 
     func isDDIMounted() async throws -> Bool {
