@@ -398,17 +398,17 @@ final internal class MinimuxerImpl: MinimuxerAPI {
     @discardableResult
     func mountDDI(docsPath: String) async throws(MinimuxerError) -> Bool {
         try await runWithChecks("while mounting DDI", catchAll: { .mount(protocol: self.activeProtocol, reason: $0) }) {
-            let (generation, task) = await makeDDIMountTask(
+            let (generation, task) = await self.makeDDIMountTask(
                 docsPath: docsPath,
                 priority: .medium,
                 replacingExisting: true
             )
             do {
                 let result = try await task.value
-                await clearDDIMountTask(generation: generation)
+                await self.clearDDIMountTask(generation: generation)
                 return result
             } catch {
-                await clearDDIMountTask(generation: generation)
+                await self.clearDDIMountTask(generation: generation)
                 throw error
             }
         }
