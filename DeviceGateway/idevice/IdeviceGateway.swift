@@ -73,8 +73,52 @@ public final class IdeviceGateway: BaseDeviceGateway, DeviceGatewayAPI, @uncheck
     }
 
     private var pairingFile: OpaquePointer? = nil
+    private var coreDeviceProvider: OpaquePointer? = nil
     private var adapter: OpaquePointer? = nil
     private var handshake: OpaquePointer? = nil
+
+    // MARK: - CoreDevice transport (LocalDevVPN utun)
+
+    // Enabled by RefreshTransportPolicy via configureCoreDeviceTransport(_).
+    // Configuration alone never opens a connection; the transport is built
+    // lazily by ensureCoreDeviceConnection() and torn down by releaseTransport().
+    private var coreDeviceEnabled = false
+    private var usesCoreDevice: Bool { coreDeviceEnabled && pairingFileType == .lockdown }
+
+    // Swift-owned Marco/Polo heartbeat. The pinned IDevice binary's
+    // tunnel_create_usb runs no internal heartbeat, so the gateway maintains
+    // one on a dedicated task. All state below is owned by the global FFI
+    // serial queue; the loop task only touches it through withFFIDispatch.
+    // A dead heartbeat never tears the tunnel down silently: the loop marks
+    // heartbeatActive = false and the next operation rebuilds via
+    // ensureCoreDeviceConnection().
+    private var heartbeatClient: OpaquePointer? = nil
+    private var heartbeatTask: Task<Void, Never>? = nil
+    private var heartbeatActive = false
+    private var heartbeatGeneration: UInt = 0
+
+    // The blocking tunnel_create_usb call runs here so a wedged handshake
+    // cannot stall the shared FFI queue indefinitely. The FFI queue waits on
+    // it with a bounded timeout covering the 20s/12s/15s phase budget.
+    private let coreDeviceBuildQueue = DispatchQueue(label: "com.sidestore.minimuxer.coredevice-build")
+    private static let coreDeviceBuildTimeout: DispatchTimeInterval = .seconds(65)
+
+    // Result box for the tunnel build: written on coreDeviceBuildQueue, read
+    // on the FFI queue after the semaphore wait establishes happens-before.
+    private final class TunnelBuildResult: @unchecked Sendable {
+        var adapter: OpaquePointer? = nil
+        var handshake: OpaquePointer? = nil
+        var error: UnsafeMutablePointer<IdeviceFfiError>? = nil
+    }
+
+    // Set when the FFI queue gives up waiting for a tunnel build. A late
+    // completion frees its own handles instead of touching gateway state.
+    private final class BuildAbandonedFlag: @unchecked Sendable {
+        private let lock = NSLock()
+        private var value = false
+        func set() { lock.withLock { value = true } }
+        var isSet: Bool { lock.withLock { value } }
+    }
 
     public override init() {
         try! super.init()
@@ -86,6 +130,7 @@ public final class IdeviceGateway: BaseDeviceGateway, DeviceGatewayAPI, @uncheck
 
     public override func cleanup() {
         debugLog("[IdeviceGateway] cleanup() called")
+        releaseTransport()
         if let pairingFile = self.pairingFile {
             verboseLog("[IdeviceGateway] cleanup() freeing pairingFile")
             if pairingFileType == .rppairing {
@@ -109,6 +154,14 @@ public final class IdeviceGateway: BaseDeviceGateway, DeviceGatewayAPI, @uncheck
 
     public override func invalidateConnection() {
         debugLog("[IdeviceGateway] invalidateConnection() called - clearing stale adapter and handshake")
+        releaseTransport()
+    }
+
+    /// Frees the CoreDevice transport: heartbeat loop, provider, adapter,
+    /// handshake. Must run on the FFI serial queue. Never touches DDI mount
+    /// generation, the pairing file, or the pairing protocol.
+    private func releaseTransport() {
+        stopCoreDeviceHeartbeat()
         if let handshake = handshake {
             rsd_handshake_free(handshake)
             self.handshake = nil
@@ -116,6 +169,10 @@ public final class IdeviceGateway: BaseDeviceGateway, DeviceGatewayAPI, @uncheck
         if let adapter = adapter {
             adapter_free(adapter)
             self.adapter = nil
+        }
+        if let provider = coreDeviceProvider {
+            idevice_provider_free(provider)
+            self.coreDeviceProvider = nil
         }
     }
 
@@ -151,6 +208,7 @@ public final class IdeviceGateway: BaseDeviceGateway, DeviceGatewayAPI, @uncheck
             parsedPairingFile = try PairingFileParser.parse(content: pairingFileContent, preferred: preferred)
             setPairingFileData(parsedPairingFile.rawData)
             setPairingFileType(parsedPairingFile.mode)
+            debugLog("[SIDESTORE_COREDEVICE] PAIRING_MODE_SELECTED mode=\(parsedPairingFile.mode)")
         } catch {
             debugLog("[IdeviceGateway] start() failed: \(error.localizedDescription)")
             throw error
@@ -239,7 +297,203 @@ public final class IdeviceGateway: BaseDeviceGateway, DeviceGatewayAPI, @uncheck
         }
     }
 
+    private func ensureCoreDeviceConnection() throws {
+        do {
+            if adapter != nil, handshake != nil, coreDeviceProvider != nil, heartbeatActive {
+                verboseLog("[SIDESTORE_COREDEVICE] TRANSPORT_REUSE")
+                return
+            }
+
+            if adapter != nil || handshake != nil || coreDeviceProvider != nil {
+                debugLog("[SIDESTORE_COREDEVICE] TRANSPORT_STALE heartbeat_active=\(heartbeatActive)")
+                releaseTransport()
+            }
+
+            guard pairingFileType == .lockdown else {
+                throw IdeviceGatewayError(.invalidPairingFile, reason: "CoreDevice transport requires a Lockdown pairing file")
+            }
+            guard let endpoint = deviceEndpointIp else {
+                throw IdeviceGatewayError(.deviceEndpointIpNotAvailable)
+            }
+            guard let data = pairingFileData else {
+                throw IdeviceGatewayError(.invalidPairingFile, reason: "Lockdown pairing data is unavailable")
+            }
+
+            debugLog("[SIDESTORE_COREDEVICE] TRANSPORT_CREATE_START endpoint=\(endpoint) port=\(getPort(for: .lockdown))")
+            var providerPairing: OpaquePointer? = nil
+            let parseError = data.withUnsafeBytes { bytes in
+                idevice_pairing_file_from_bytes(
+                    bytes.baseAddress?.assumingMemoryBound(to: UInt8.self),
+                    UInt(data.count),
+                    &providerPairing
+                )
+            }
+            if let parseError {
+                let message = getErrorMessage(from: parseError)
+                idevice_error_free(parseError)
+                throw IdeviceGatewayError(.invalidPairingFile, reason: "Lockdown pairing parse failed: \(message)")
+            }
+            guard let providerPairing else {
+                throw IdeviceGatewayError(.invalidPairingFile, reason: "Lockdown pairing parse returned nil")
+            }
+
+            var pairingConsumed = false
+            defer { if !pairingConsumed { idevice_pairing_file_free(providerPairing) } }
+            var provider: OpaquePointer? = nil
+            var providerError: UnsafeMutablePointer<IdeviceFfiError>? = nil
+            try MinimuxerConstants.appName.withCString { label in
+                try withSockaddr(ip: endpoint, port: getPort(for: .lockdown)) { address, _ in
+                    pairingConsumed = true
+                    providerError = idevice_tcp_provider_new(address, providerPairing, label, &provider)
+                }
+            }
+            // idevice_tcp_provider_new consumes providerPairing for valid address/label inputs.
+            if let providerError {
+                let message = getErrorMessage(from: providerError)
+                idevice_error_free(providerError)
+                throw IdeviceGatewayError(.connectionFailed, reason: "CoreDevice provider creation failed: \(message)")
+            }
+            guard let provider else {
+                throw IdeviceGatewayError(.connectionFailed, reason: "CoreDevice provider creation returned nil")
+            }
+            coreDeviceProvider = provider
+            debugLog("[SIDESTORE_COREDEVICE] PROVIDER_CREATE_PASS")
+
+            try createCoreDeviceTunnel(provider: provider)
+
+            guard adapter != nil, handshake != nil else {
+                releaseTransport()
+                throw IdeviceGatewayError(.connectionFailed, reason: "CoreDevice tunnel returned incomplete handles")
+            }
+            try startCoreDeviceHeartbeat()
+            debugLog("[SIDESTORE_COREDEVICE] TRANSPORT_CREATE_PASS selected_transport=COREDEVICE_LOCALDEVVPN")
+        } catch {
+            releaseTransport()
+            debugLog("[SIDESTORE_COREDEVICE] selected_transport=FAILED_NO_VALID_TRANSPORT reason=\(error.localizedDescription)")
+            throw error
+        }
+    }
+
+    /// Runs the blocking tunnel_create_usb on coreDeviceBuildQueue and waits
+    /// with a bounded timeout. A timed-out build is abandoned: its late
+    /// completion frees its own handles and never touches gateway state.
+    private func createCoreDeviceTunnel(provider: OpaquePointer) throws {
+        let result = TunnelBuildResult()
+        let abandoned = BuildAbandonedFlag()
+        let semaphore = DispatchSemaphore(value: 0)
+        coreDeviceBuildQueue.async {
+            result.error = tunnel_create_usb(provider, &result.adapter, &result.handshake)
+            if abandoned.isSet {
+                if let handshake = result.handshake { rsd_handshake_free(handshake) }
+                if let adapter = result.adapter { adapter_free(adapter) }
+                result.adapter = nil
+                result.handshake = nil
+            }
+            semaphore.signal()
+        }
+        guard semaphore.wait(timeout: .now() + Self.coreDeviceBuildTimeout) == .success else {
+            abandoned.set()
+            throw IdeviceGatewayError(.connectionFailed, reason: "CoreDevice tunnel timed out after 65s")
+        }
+        if let tunnelError = result.error {
+            let message = getErrorMessage(from: tunnelError)
+            let code = tunnelError.pointee.code
+            let subCode = tunnelError.pointee.sub_code
+            idevice_error_free(tunnelError)
+            debugLog("[SIDESTORE_COREDEVICE] TRANSPORT_CREATE_FAIL code=\(code) subcode=\(subCode) error=\(message)")
+            throw IdeviceGatewayError(.connectionFailed, reason: "CoreDevice tunnel failed: \(message)")
+        }
+        adapter = result.adapter
+        handshake = result.handshake
+    }
+
+    /// Connects the Swift-owned Marco/Polo heartbeat and starts its watchdog
+    /// loop. Called synchronously on the FFI queue, so heartbeatActive is
+    /// already accurate when ensureCoreDeviceConnection() returns.
+    private func startCoreDeviceHeartbeat() throws {
+        stopCoreDeviceHeartbeat()
+        guard let adapter, let handshake else {
+            throw IdeviceGatewayError(.connectionFailed, reason: "CoreDevice heartbeat requires an established tunnel")
+        }
+        var client: OpaquePointer? = nil
+        if let connectError = heartbeat_connect_rsd(adapter, handshake, &client) {
+            let message = getErrorMessage(from: connectError)
+            idevice_error_free(connectError)
+            throw IdeviceGatewayError(.connectionFailed, reason: "CoreDevice heartbeat connect failed: \(message)")
+        }
+        guard let client else {
+            throw IdeviceGatewayError(.connectionFailed, reason: "CoreDevice heartbeat connect returned nil")
+        }
+        heartbeatClient = client
+        heartbeatActive = true
+        heartbeatGeneration &+= 1
+        let generation = heartbeatGeneration
+        verboseLog("[SIDESTORE_COREDEVICE] HEARTBEAT_START")
+        heartbeatTask = Task.detached { [weak self] in
+            await self?.runCoreDeviceHeartbeatLoop(generation: generation)
+        }
+    }
+
+    private func stopCoreDeviceHeartbeat() {
+        heartbeatGeneration &+= 1
+        heartbeatTask?.cancel()
+        heartbeatTask = nil
+        if let client = heartbeatClient {
+            heartbeat_client_free(client)
+            heartbeatClient = nil
+        }
+        heartbeatActive = false
+    }
+
+    /// Marks the heartbeat dead without tearing down the transport handles.
+    /// Watchdog: the next operation's ensureCoreDeviceConnection() rebuilds
+    /// the transport instead of letting the tunnel die silently.
+    private func noteHeartbeatFailure(generation: UInt, reason: String) {
+        guard generation == heartbeatGeneration else { return }
+        debugLog("[SIDESTORE_COREDEVICE] HEARTBEAT_FAIL reason=\(reason)")
+        if let client = heartbeatClient {
+            heartbeat_client_free(client)
+            heartbeatClient = nil
+        }
+        heartbeatActive = false
+    }
+
+    /// Marco/Polo loop. Beats every 60s, well under the 90s RSD timeout.
+    /// All FFI and state access goes through withFFIDispatch so the loop can
+    /// never race transport teardown on the FFI serial queue.
+    private func runCoreDeviceHeartbeatLoop(generation: UInt) async {
+        while !Task.isCancelled {
+            try? await Task.sleep(nanoseconds: 60 * 1_000_000_000)
+            if Task.isCancelled { break }
+            let failed: Bool = (try? await withFFIDispatch { () -> Bool in
+                guard generation == self.heartbeatGeneration,
+                      let client = self.heartbeatClient else { return true }
+                var newInterval: UInt64 = 0
+                if let marcoError = heartbeat_get_marco(client, 60, &newInterval) {
+                    let message = getErrorMessage(from: marcoError)
+                    idevice_error_free(marcoError)
+                    self.noteHeartbeatFailure(generation: generation, reason: "marco: \(message)")
+                    return true
+                }
+                if let poloError = heartbeat_send_polo(client) {
+                    let message = getErrorMessage(from: poloError)
+                    idevice_error_free(poloError)
+                    self.noteHeartbeatFailure(generation: generation, reason: "polo: \(message)")
+                    return true
+                }
+                verboseLog("[SIDESTORE_COREDEVICE] HEARTBEAT_POLO_PASS")
+                return false
+            }) ?? true
+            if failed { break }
+        }
+        verboseLog("[SIDESTORE_COREDEVICE] HEARTBEAT_LOOP_EXIT")
+    }
+
     private func ensureRPConnection() throws {
+        if usesCoreDevice {
+            try ensureCoreDeviceConnection()
+            return
+        }
         debugLog("[IdeviceGateway] ensureRPConnection() started, adapter: \(String(describing: adapter)), handshake: \(String(describing: handshake))")
         if adapter != nil && handshake != nil {
             verboseLog("[IdeviceGateway] ensureRPConnection() using existing connection")
@@ -629,7 +883,7 @@ public final class IdeviceGateway: BaseDeviceGateway, DeviceGatewayAPI, @uncheck
         action: (OpaquePointer) throws -> T
     ) throws -> T {
         debugLog("[IdeviceGateway] performWithEitherService(\(serviceName)) started, mode = .\(pairingFileType)")
-        if pairingFileType == .rppairing {
+        if pairingFileType == .rppairing || usesCoreDevice {
             return try performWithService(connect: connectRP, cleanup: cleanup, serviceName: serviceName, action: action)
         } else {
             return try performWithTcpService(connect: connectLockdown, cleanup: cleanup, serviceName: serviceName, action: action)
@@ -1345,6 +1599,14 @@ public final class IdeviceGateway: BaseDeviceGateway, DeviceGatewayAPI, @uncheck
     private func syncPerformHeartbeat(interval: UInt64, newInterval: UnsafeMutablePointer<UInt64>) throws {
        debugLog("[IdeviceGateway] performHeartbeat() called, interval: \(interval)")
        try verifyInitialized()
+       if usesCoreDevice {
+           guard heartbeatActive else {
+               throw IdeviceGatewayError(.connectionFailed, reason: "CoreDevice heartbeat is inactive")
+           }
+           newInterval.pointee = 60
+           verboseLog("[SIDESTORE_COREDEVICE] HEARTBEAT_ACTIVE")
+           return
+       }
        try performWithEitherService(
            connectRP: heartbeat_connect_rsd,
            connectLockdown: heartbeat_connect,
@@ -1375,7 +1637,7 @@ public final class IdeviceGateway: BaseDeviceGateway, DeviceGatewayAPI, @uncheck
         debugLog("[IdeviceGateway] mountPersonalizedDdi() called, image size: \(image.count), trustcache size: \(trustcache.count), manifest size: \(manifest.count)")
         try verifyInitialized()
 
-        if pairingFileType == .rppairing {
+        if pairingFileType == .rppairing || usesCoreDevice {
             try mountPersonalizedDdiRsd(image: image, trustcache: trustcache, manifest: manifest)
             return
         }
