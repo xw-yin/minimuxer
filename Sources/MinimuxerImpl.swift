@@ -98,20 +98,34 @@ final internal class MinimuxerImpl: MinimuxerAPI {
         await self.connectionManager.getPreferredConnectionMode()
     }
 
-    // Transport batch lease: held by refresh pipelines so the CoreDevice
-    // transport is not torn down between operations. Upgraded by M6 to
-    // re-run transport selection when a batch begins.
-    func beginTransportBatch() async {
-        await gateway.beginTransportBatch()
-    }
-
-    func endTransportBatch() async { await gateway.endTransportBatch() }
-    
     func bindConnectionConfig(_ binding: ConnectionConfigBinding) async {
         await self.connectionManager.bindConnectionConfig(binding)
         await self.network.refreshEndpoint()
     }
     
+    @discardableResult
+    private func configureRefreshTransport() async -> RefreshTransportDecision {
+        let modernOS: Bool
+        if #available(iOS 26.4, *) { modernOS = true } else { modernOS = false }
+        let mode = await getConnectionMode()
+        let utun = network.isUTunAvailable
+        let ipsec = network.isIKEv2IPSecAvailable
+        let decision = RefreshTransportPolicy.select(
+            modernOS: modernOS, mode: mode, pairing: gateway.pairingFileType,
+            utun: utun, ipsec: ipsec, coreDeviceSupported: gateway.supportsCoreDeviceTransport)
+        gateway.configureCoreDeviceTransport(decision.transport == .coreDevice)
+        // Interface presence cannot establish the identity of the App Store VPN.
+        debugLog("[SIDESTORE_COREDEVICE] TRANSPORT_SELECTION os_version=\(ProcessInfo.processInfo.operatingSystemVersionString) pairing_mode=\(gateway.pairingFileType) localdevvpn_detected=unverified utun_detected=\(utun) ipsec_interface_detected=\(ipsec) selected_transport=\(decision.transport.rawValue) reason=\(decision.reason)")
+        return decision
+    }
+
+    func beginTransportBatch() async {
+        await gateway.beginTransportBatch()
+        await configureRefreshTransport()
+    }
+
+    func endTransportBatch() async { await gateway.endTransportBatch() }
+
     func isReady(withNetworkCheck: Bool, withDDIMountCheck: Bool) async -> Result<Bool, MinimuxerError> {
         if !isPairingFileLoaded {
             debugLog("[minimuxer] minimuxer not ready: pairing file not loaded")
@@ -133,6 +147,18 @@ final internal class MinimuxerImpl: MinimuxerAPI {
         ){
             debugLog("[minimuxer] minimuxer not ready: no network connection")
             return .failure(.noConnection("No wifi interface satisfied"))
+        }
+
+        // CoreDevice transport selection: consult RefreshTransportPolicy before
+        // the legacy connection-mode checks below.
+        let transportDecision = await configureRefreshTransport()
+        if transportDecision.transport == .unavailable {
+            return .failure(.invalidVPN(transportDecision.reason))
+        }
+        if transportDecision.transport == .coreDevice {
+            verboseLog("[SIDESTORE_COREDEVICE] LOCALVPN_UTUN_ACCEPTED transport=lockdown-coredevice")
+            // Network-change UI checks must not start CoreDevice/signing work.
+            if !gateway.hasActiveTransportBatch { return .success(false) }
         }
 
         // check connection mode
@@ -313,6 +339,7 @@ final internal class MinimuxerImpl: MinimuxerAPI {
             try await self.gateway.start(pairingFileContent: pairingFile, preferred: preferred)
         }
         if self.gateway.requiresUsbmuxd {
+            await configureRefreshTransport()
             // retarget usbmuxd to our fake usbmuxd server (over network)
             retargetUsbmuxdAddr()
             // start our fake usbmuxd server for clients if required
