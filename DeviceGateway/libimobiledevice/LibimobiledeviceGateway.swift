@@ -721,12 +721,41 @@ public final class LibimobiledeviceGateway: BaseDeviceGateway, DeviceGatewayAPI,
             var xmlPtr: UnsafeMutablePointer<CChar>? = nil
             var xmlLen: UInt32 = 0
             plist_to_xml(profilesPlist, &xmlPtr, &xmlLen)
-            if let xmlPtr = xmlPtr {
-                let xmlStr = String(cString: xmlPtr)
-                free(xmlPtr)
-                return xmlStr
+            guard let xmlPtr = xmlPtr else { return dumpDir }
+            defer { free(xmlPtr) }
+            let xmlStr = String(cString: xmlPtr)
+
+            // misagent CopyAll returns { identifier: profileData }; materialize
+            // each profile as a file so callers receive a real directory to archive
+            // (returning the XML string here breaks the zip flow downstream).
+            if let xmlData = xmlStr.data(using: .utf8),
+               let top = try? PropertyListSerialization.propertyList(from: xmlData, format: nil) {
+                let entries: [(String, Any)]
+                if let dict = top as? [String: Any] {
+                    entries = dict.map { ($0.key, $0.value) }
+                } else if let arr = top as? [Any] {
+                    entries = arr.enumerated().map { ("Profile_\($0.offset)", $0.element) }
+                } else {
+                    entries = []
+                }
+                for (key, value) in entries {
+                    let profileData: Data?
+                    if let data = value as? Data {
+                        profileData = data
+                    } else if let subDict = value as? [String: Any],
+                              let subData = try? PropertyListSerialization.data(fromPropertyList: subDict, format: .xml, options: 0) {
+                        profileData = subData
+                    } else {
+                        profileData = nil
+                    }
+                    if let profileData = profileData, !profileData.isEmpty {
+                        let safeKey = key.replacingOccurrences(of: "/", with: "_")
+                        let filePath = (dumpDir as NSString).appendingPathComponent("\(safeKey).mobileprovision")
+                        try? profileData.write(to: URL(fileURLWithPath: filePath))
+                    }
+                }
             }
-            return ""
+            return dumpDir
         }
     }
 
