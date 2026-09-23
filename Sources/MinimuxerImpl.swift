@@ -71,6 +71,7 @@ final internal class MinimuxerImpl: MinimuxerAPI {
     private actor State {
         var status: MinimuxerStatus = .stopped
         var mountTask: Task<Bool, Error>? = nil
+        var mountGeneration: UInt = 0
         var lastDocsPath: String? = nil
         var preferredProtocol: PairingProtocol? = nil
         
@@ -380,29 +381,66 @@ final internal class MinimuxerImpl: MinimuxerAPI {
             throw MinimuxerError.mount(protocol: activeProtocol, reason: "DDI mount path not set")
         }
         verboseLog("[minimuxer] DDI not mounted, mounting now before launching debug session...")
-        try await self.mountDDI(docsPath: mountPath)
+        let (generation, task) = await makeDDIMountTask(
+            docsPath: mountPath,
+            priority: .userInitiated
+        )
+        do {
+            _ = try await task.value
+            await clearDDIMountTask(generation: generation)
+        } catch {
+            await clearDDIMountTask(generation: generation)
+            throw MinimuxerError.mount(protocol: self.activeProtocol, reason: "DDI mount failed: \(error)")
+        }
     }
 
     
     @discardableResult
     func mountDDI(docsPath: String) async throws(MinimuxerError) -> Bool {
         try await runWithChecks("while mounting DDI", catchAll: { .mount(protocol: self.activeProtocol, reason: $0) }) {
-            let oldTask = await self.state.with { state -> Task<Bool, Error>? in
-                state.lastDocsPath = docsPath
-                let task = state.mountTask
-                task?.cancel()
-                state.mountTask = nil
-                return task
+            let (generation, task) = await makeDDIMountTask(
+                docsPath: docsPath,
+                priority: .medium,
+                replacingExisting: true
+            )
+            do {
+                let result = try await task.value
+                await clearDDIMountTask(generation: generation)
+                return result
+            } catch {
+                await clearDDIMountTask(generation: generation)
+                throw error
             }
-            _ = await oldTask?.result
-            let mounter = self.mounter
-            let task = Task.detached(priority: .medium) {
+        }
+    }
+
+    private func makeDDIMountTask(
+        docsPath: String,
+        priority: TaskPriority,
+        replacingExisting: Bool = false
+    ) async -> (UInt, Task<Bool, Error>) {
+        let mounter = self.mounter
+        return await state.with {
+            $0.lastDocsPath = docsPath
+            if !replacingExisting, let task = $0.mountTask {
+                return ($0.mountGeneration, task)
+            }
+
+            $0.mountTask?.cancel()
+            $0.mountGeneration &+= 1
+            let generation = $0.mountGeneration
+            let task = Task.detached(priority: priority) {
                 try await mounter.mount(docsPath: docsPath)
             }
-            await self.state.with {
-                $0.mountTask = task
-            }
-            return try await task.value
+            $0.mountTask = task
+            return (generation, task)
+        }
+    }
+
+    private func clearDDIMountTask(generation: UInt) async {
+        await state.with {
+            guard $0.mountGeneration == generation else { return }
+            $0.mountTask = nil
         }
     }
 
