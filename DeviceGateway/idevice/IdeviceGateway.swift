@@ -132,17 +132,17 @@ public final class IdeviceGateway: BaseDeviceGateway, DeviceGatewayAPI, @uncheck
 
     public var supportsCoreDeviceTransport: Bool { true }
     public var coreDeviceTransportEnabled: Bool {
-        withFFIDispatchSync { usesCoreDevice }
+        withFFIDispatchSync { self.usesCoreDevice }
     }
     public var hasActiveTransportBatch: Bool {
-        withFFIDispatchSync { batchCount > 0 }
+        withFFIDispatchSync { self.batchCount > 0 }
     }
 
     public func configureCoreDeviceTransport(_ enabled: Bool) {
         withFFIDispatchSync {
-            guard coreDeviceEnabled != enabled else { return }
-            releaseTransport()
-            coreDeviceEnabled = enabled
+            guard self.coreDeviceEnabled != enabled else { return }
+            self.releaseTransport()
+            self.coreDeviceEnabled = enabled
         }
     }
 
