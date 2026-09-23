@@ -545,7 +545,7 @@ public final class IdeviceGateway: BaseDeviceGateway, DeviceGatewayAPI, @uncheck
                     self.noteHeartbeatFailure(generation: generation, reason: "polo: \(message)")
                     return true
                 }
-                self.verboseLog("[SIDESTORE_COREDEVICE] HEARTBEAT_POLO_PASS")
+                verboseLog("[SIDESTORE_COREDEVICE] HEARTBEAT_POLO_PASS")
                 return false
             }) ?? true
             if failed { break }
