@@ -120,6 +120,60 @@ public final class IdeviceGateway: BaseDeviceGateway, DeviceGatewayAPI, @uncheck
         var isSet: Bool { lock.withLock { value } }
     }
 
+    // MARK: - Transport batch lease
+
+    // COMBINED_COREDEVICE_BATCH_V1: no connection is opened by configuration.
+    private var batchCount = 0
+
+    // Signed identity of the last successfully staged bundle per bundle ID.
+    // Guards installation against partially staged or mismatched uploads.
+    // Owned by the FFI serial queue.
+    private var stagedBundleIdentities: [String: (appName: String, signedIdentifier: String)] = [:]
+
+    public var supportsCoreDeviceTransport: Bool { true }
+    public var coreDeviceTransportEnabled: Bool {
+        withFFIDispatchSync { usesCoreDevice }
+    }
+    public var hasActiveTransportBatch: Bool {
+        withFFIDispatchSync { batchCount > 0 }
+    }
+
+    public func configureCoreDeviceTransport(_ enabled: Bool) {
+        withFFIDispatchSync {
+            guard coreDeviceEnabled != enabled else { return }
+            releaseTransport()
+            coreDeviceEnabled = enabled
+        }
+    }
+
+    public func beginTransportBatch() async {
+        try? await withFFIDispatch {
+            self.batchCount += 1
+            debugLog("[SIDESTORE_COREDEVICE] BATCH_BEGIN active_batches=\(self.batchCount)")
+        }
+    }
+
+    public func endTransportBatch() async {
+        try? await withFFIDispatch {
+            self.batchCount = max(0, self.batchCount - 1)
+            if self.batchCount == 0 {
+                self.releaseTransport()
+                self.stagedBundleIdentities.removeAll()
+            }
+            debugLog("[SIDESTORE_COREDEVICE] BATCH_END active_batches=\(self.batchCount)")
+        }
+    }
+
+    /// Tears the transport down unless a batch lease is held. Runs at the end
+    /// of every non-batch gateway operation via the withFFIDispatch defer.
+    /// Never touches DDI mount generation, the pairing file, or the pairing
+    /// protocol, so a mid-batch service reconnect only rebuilds the tunnel.
+    private func releaseTransportIfIdle() {
+        if batchCount == 0 {
+            releaseTransport()
+        }
+    }
+
     public override init() {
         try! super.init()
     }
@@ -131,6 +185,7 @@ public final class IdeviceGateway: BaseDeviceGateway, DeviceGatewayAPI, @uncheck
     public override func cleanup() {
         debugLog("[IdeviceGateway] cleanup() called")
         releaseTransport()
+        stagedBundleIdentities.removeAll()
         if let pairingFile = self.pairingFile {
             verboseLog("[IdeviceGateway] cleanup() freeing pairingFile")
             if pairingFileType == .rppairing {
@@ -178,6 +233,7 @@ public final class IdeviceGateway: BaseDeviceGateway, DeviceGatewayAPI, @uncheck
 
     public override func stop() async throws {
         try await withFFIDispatch {
+            defer { self.releaseTransportIfIdle() }
             self.cleanup()
         }
         try await super.stop()
@@ -1041,7 +1097,8 @@ public final class IdeviceGateway: BaseDeviceGateway, DeviceGatewayAPI, @uncheck
     }
 
     private func syncsendIpaAfc(bundleId: String, ipaBytes: Data) throws {
-        debugLog("[IdeviceGateway] sendIpaAfc() called, bundleId: \(bundleId), ipaBytes size: \(ipaBytes.count)")
+        stagedBundleIdentities.removeValue(forKey: bundleId)
+        debugLog("[SELF_REFRESH] AFC_CONNECT_START bundle_id=\(bundleId)")
         try verifyInitialized()
         try performWithEitherService(
             connectRP: afc_client_connect_rsd,
@@ -1049,53 +1106,134 @@ public final class IdeviceGateway: BaseDeviceGateway, DeviceGatewayAPI, @uncheck
             cleanup: afc_client_free,
             serviceName: "AFC client"
         ) { client in
-            // Ensure directory
+            debugLog("[SELF_REFRESH] AFC_CONNECT_PASS")
             let stagingDir = MinimuxerConstants.pkgPath
-            verboseLog("[IdeviceGateway] sendIpaAfc() creating directory: \(stagingDir)")
-            _ = stagingDir.withCString { dirPtr in
-                afc_make_directory(client, dirPtr)
-            }
+            _ = stagingDir.withCString { afc_make_directory(client, $0) }
             let bundleDir = "\(stagingDir)/\(bundleId)"
-            verboseLog("[IdeviceGateway] sendIpaAfc() creating directory: \(bundleDir)")
-            _ = bundleDir.withCString { dirPtr in
-                afc_make_directory(client, dirPtr)
-            }
- 
+            _ = bundleDir.withCString { afc_make_directory(client, $0) }
+
             let path = "\(bundleDir)/app.ipa"
             var fileHandle: OpaquePointer? = nil
-            verboseLog("[IdeviceGateway] sendIpaAfc() opening remote file: \(path)")
-            let openErr = path.withCString { pathPtr in
-                afc_file_open(client, pathPtr, AfcFopenMode(rawValue: 4), &fileHandle) // WrOnly/Wr mode
+            verboseLog("[SELF_REFRESH] AFC_FILE_OPEN_START path=\(path)")
+            let openError = path.withCString {
+                afc_file_open(client, $0, AfcFopenMode(rawValue: 4), &fileHandle)
             }
-            if let openErr = openErr {
-                let msg = self.getErrorMessage(from: openErr)
-                debugLog("[IdeviceGateway] sendIpaAfc() afc_file_open failed: \(msg)")
-                defer { idevice_error_free(openErr) }
-                throw IdeviceGatewayError(.serviceError, reason: "Failed to open remote AFC file, error: (\(msg))")
+            if let openError {
+                let message = self.getErrorMessage(from: openError)
+                idevice_error_free(openError)
+                throw IdeviceGatewayError(.serviceError, reason: "AFC file open failed: \(message)")
             }
+            guard let fileHandle else {
+                throw IdeviceGatewayError(.serviceError, reason: "AFC file open returned nil")
+            }
+            verboseLog("[SELF_REFRESH] AFC_FILE_OPEN_PASS")
+
+            var closeNeeded = true
             defer {
-                verboseLog("[IdeviceGateway] sendIpaAfc() closing remote file handle")
-                afc_file_close(fileHandle)
-            }
- 
-            try ipaBytes.withUnsafeBytes { (buf: UnsafeRawBufferPointer) in
-                if let baseAddress = buf.baseAddress?.assumingMemoryBound(to: UInt8.self) {
-                    verboseLog("[IdeviceGateway] sendIpaAfc() writing data to AFC file")
-                    let writeErr = afc_file_write(fileHandle, baseAddress, ipaBytes.count)
-                    if let writeErr = writeErr {
-                        let msg = self.getErrorMessage(from: writeErr)
-                        debugLog("[IdeviceGateway] sendIpaAfc() afc_file_write failed: \(msg)")
-                        defer { idevice_error_free(writeErr) }
-                        throw IdeviceGatewayError(.serviceError, reason: "Failed to write to AFC file, error: (\(msg))")
-                    }
-                    debugLog("[IdeviceGateway] sendIpaAfc() afc_file_write succeeded")
+                if closeNeeded, let closeError = afc_file_close(fileHandle) {
+                    idevice_error_free(closeError)
                 }
             }
+
+            let chunkSize = 32 * 1024
+            var offset = 0
+            var chunkIndex = 0
+            verboseLog("[SELF_REFRESH] IPA_STAGE_START size=\(ipaBytes.count)")
+            try ipaBytes.withUnsafeBytes { bytes in
+                guard let base = bytes.baseAddress?.assumingMemoryBound(to: UInt8.self) else {
+                    if ipaBytes.isEmpty { return }
+                    throw IdeviceGatewayError(.serviceError, reason: "IPA data has no base address")
+                }
+                while offset < ipaBytes.count {
+                    let requested = min(chunkSize, ipaBytes.count - offset)
+                    chunkIndex += 1
+                    let started = CFAbsoluteTimeGetCurrent()
+                    verboseLog("[SELF_REFRESH] AFC_WRITE_BEGIN chunk_index=\(chunkIndex) offset=\(offset) requested=\(requested)")
+                    let writeError = afc_file_write(fileHandle, base.advanced(by: offset), requested)
+                    let elapsedMs = Int((CFAbsoluteTimeGetCurrent() - started) * 1000)
+                    if let writeError {
+                        let message = self.getErrorMessage(from: writeError)
+                        idevice_error_free(writeError)
+                        debugLog("[SELF_REFRESH] AFC_WRITE_FAIL chunk_index=\(chunkIndex) elapsed_ms=\(elapsedMs) error=\(message)")
+                        throw IdeviceGatewayError(.serviceError, reason: "AFC write failed at offset \(offset): \(message)")
+                    }
+                    // A nil FFI result means write_entire completed the full requested slice.
+                    offset += requested
+                    verboseLog("[SELF_REFRESH] AFC_WRITE_RETURN chunk_index=\(chunkIndex) written=\(requested) elapsed_ms=\(elapsedMs)")
+                }
+            }
+            verboseLog("[SELF_REFRESH] STAGING_WRITE_LOOP_DONE staged_bytes=\(offset)")
+
+            verboseLog("[SELF_REFRESH] AFC_FILE_CLOSE_START")
+            closeNeeded = false
+            if let closeError = afc_file_close(fileHandle) {
+                let message = self.getErrorMessage(from: closeError)
+                idevice_error_free(closeError)
+                throw IdeviceGatewayError(.serviceError, reason: "AFC file close failed: \(message)")
+            }
+            verboseLog("[SELF_REFRESH] AFC_FILE_CLOSE_PASS")
+
+            let (_, stagedSize) = try self.afcGetFileInfo(client: client, path: path)
+            let sizeMatches = stagedSize == Int64(ipaBytes.count)
+            verboseLog("[SELF_REFRESH] STAGED_FILE_SIZE=\(stagedSize)")
+            verboseLog("[SELF_REFRESH] STAGED_FILE_SIZE_MATCH=\(sizeMatches)")
+            guard sizeMatches else {
+                throw IdeviceGatewayError(
+                    .serviceError,
+                    reason: "Staged IPA size mismatch: expected \(ipaBytes.count), got \(stagedSize)"
+                )
+            }
+            debugLog("[SELF_REFRESH] SIDESTORE_STAGE_PASS bundle_id=\(bundleId) bytes=\(stagedSize)")
         }
     }
 
+    private func verifyInstalledBundle(client: OpaquePointer, bundleId: String, allowLegacyPrefix: Bool = false) throws {
+        debugLog("[SELF_REFRESH] POST_INSTALL_BROWSE_START bundle_id=\(bundleId)")
+        var result: UnsafeMutableRawPointer? = nil
+        var count = 0
+        // Exact signed identity for raw bundles; legacy prefix matching for IPA only.
+        // Neither lookup verifies signing expiry or host relaunch.
+        let browseError = installation_proxy_get_apps(client, nil, nil, 0, &result, &count)
+        if let browseError {
+            let message = self.getErrorMessage(from: browseError)
+            idevice_error_free(browseError)
+            throw IdeviceGatewayError(.serviceError, reason: "Post-install browse failed: \(message)")
+        }
+        debugLog("[SELF_REFRESH] POST_INSTALL_BROWSE_PASS count=\(count)")
+        guard let result else {
+            throw IdeviceGatewayError(.serviceError, reason: "Post-install browse returned no result")
+        }
+        let applications = result.assumingMemoryBound(to: plist_t?.self)
+        defer { idevice_plist_array_free(applications, UInt(count)) }
+
+        var matchedIdentifier: String? = nil
+        var matchedVersion: String? = nil
+        for index in 0..<count {
+            guard let application = applications[index] else { continue }
+            if let identifierNode = plist_dict_get_item(application, "CFBundleIdentifier") {
+                guard let identifier = getRustPlistString(identifierNode) else { continue }
+                if identifier == bundleId {
+                    matchedIdentifier = identifier
+                    if let versionNode = plist_dict_get_item(application, "CFBundleShortVersionString") {
+                        matchedVersion = getRustPlistString(versionNode)
+                    }
+                } else if allowLegacyPrefix && identifier.hasPrefix("\(bundleId).") {
+                    matchedIdentifier = identifier
+                    if let versionNode = plist_dict_get_item(application, "CFBundleShortVersionString") {
+                        matchedVersion = getRustPlistString(versionNode)
+                    }
+                }
+            }
+        }
+        guard let matchedIdentifier else {
+            throw IdeviceGatewayError(.serviceError, reason: "Installed bundle was not found: \(bundleId)")
+        }
+        debugLog("[SELF_REFRESH] INSTALLED_APP_LOOKUP_PASS requested_bundle_id=\(bundleId) installed_bundle_id=\(matchedIdentifier) version=\(matchedVersion ?? "unknown")")
+        debugLog("[SELF_REFRESH] SIDESTORE_POST_INSTALL_VERIFY_PASS installed_presence_only=true bundle_id=\(matchedIdentifier)")
+    }
+
     private func syncInstallIpa(bundleId: String) throws {
-        debugLog("[IdeviceGateway] installIpa() called, bundleId: \(bundleId)")
+        debugLog("[SELF_REFRESH] INSTALL_PROXY_CONNECT_START bundle_id=\(bundleId)")
         try verifyInitialized()
         try performWithEitherService(
             connectRP: installation_proxy_connect_rsd,
@@ -1103,22 +1241,106 @@ public final class IdeviceGateway: BaseDeviceGateway, DeviceGatewayAPI, @uncheck
             cleanup: installation_proxy_client_free,
             serviceName: "instproxy"
         ) { client in
+            debugLog("[SELF_REFRESH] INSTALL_PROXY_CONNECT_PASS")
             let path = "PublicStaging/\(bundleId)/app.ipa"
-            try path.withCString { pathPtr in
-                verboseLog("[IdeviceGateway] installIpa() calling installation_proxy_install for path: \(path)")
-                let installErr = installation_proxy_install(client, pathPtr, nil)
-                if let installErr = installErr {
-                    let msg = self.getErrorMessage(from: installErr)
-                    debugLog("[IdeviceGateway] installIpa() installation_proxy_install failed: \(msg)")
-                    defer { idevice_error_free(installErr) }
-                    throw IdeviceGatewayError(.serviceError, reason: "Failed to install IPA, error: (\(msg))")
-                }
-                debugLog("[IdeviceGateway] installIpa() installation_proxy_install succeeded")
+            debugLog("[SELF_REFRESH] SIDESTORE_INSTALL_REQUEST_START path=\(path)")
+            let installError = path.withCString { installation_proxy_install(client, $0, nil) }
+            if let installError {
+                let message = self.getErrorMessage(from: installError)
+                idevice_error_free(installError)
+                throw IdeviceGatewayError(.serviceError, reason: "IPA install failed: \(message)")
             }
+            // installation_proxy_install waits for the terminal Complete status.
+            debugLog("[SELF_REFRESH] SIDESTORE_INSTALL_REQUEST_PASS bundle_id=\(bundleId)")
+            debugLog("[SELF_REFRESH] SIDESTORE_INSTALL_COMPLETE bundle_id=\(bundleId)")
+            try verifyInstalledBundle(client: client, bundleId: bundleId, allowLegacyPrefix: true)
+        }
+    }
+
+    /// Writes one bundle file with checked chunked writes, then verifies the
+    /// staged size. Used for every file of a raw .app bundle so a partial
+    /// upload can never be mistaken for a complete stage.
+    private func writeVerifiedBundleFile(client: OpaquePointer, path: String, fileData: Data) throws {
+        var fileHandle: OpaquePointer? = nil
+        verboseLog("[SELF_REFRESH] AFC_FILE_OPEN_START path=\(path)")
+        let openError = path.withCString {
+            afc_file_open(client, $0, AfcFopenMode(rawValue: 4), &fileHandle)
+        }
+        if let openError {
+            let message = self.getErrorMessage(from: openError)
+            idevice_error_free(openError)
+            throw IdeviceGatewayError(.serviceError, reason: "AFC file open failed: \(message)")
+        }
+        guard let fileHandle else {
+            throw IdeviceGatewayError(.serviceError, reason: "AFC file open returned nil")
+        }
+        verboseLog("[SELF_REFRESH] AFC_FILE_OPEN_PASS")
+
+        var closeNeeded = true
+        defer {
+            if closeNeeded, let closeError = afc_file_close(fileHandle) {
+                idevice_error_free(closeError)
+            }
+        }
+
+        let chunkSize = 32 * 1024
+        var offset = 0
+        var chunkIndex = 0
+        verboseLog("[SELF_REFRESH] file_STAGE_START size=\(fileData.count)")
+        try fileData.withUnsafeBytes { bytes in
+            guard let base = bytes.baseAddress?.assumingMemoryBound(to: UInt8.self) else {
+                if fileData.isEmpty { return }
+                throw IdeviceGatewayError(.serviceError, reason: "file data has no base address")
+            }
+            while offset < fileData.count {
+                let requested = min(chunkSize, fileData.count - offset)
+                chunkIndex += 1
+                let started = CFAbsoluteTimeGetCurrent()
+                verboseLog("[SELF_REFRESH] AFC_WRITE_BEGIN chunk_index=\(chunkIndex) offset=\(offset) requested=\(requested)")
+                let writeError = afc_file_write(fileHandle, base.advanced(by: offset), requested)
+                let elapsedMs = Int((CFAbsoluteTimeGetCurrent() - started) * 1000)
+                if let writeError {
+                    let message = self.getErrorMessage(from: writeError)
+                    idevice_error_free(writeError)
+                    debugLog("[SELF_REFRESH] AFC_WRITE_FAIL chunk_index=\(chunkIndex) elapsed_ms=\(elapsedMs) error=\(message)")
+                    throw IdeviceGatewayError(.serviceError, reason: "AFC write failed at offset \(offset): \(message)")
+                }
+                // A nil FFI result means write_entire completed the full requested slice.
+                offset += requested
+                verboseLog("[SELF_REFRESH] AFC_WRITE_RETURN chunk_index=\(chunkIndex) written=\(requested) elapsed_ms=\(elapsedMs)")
+            }
+        }
+        verboseLog("[SELF_REFRESH] STAGING_WRITE_LOOP_DONE staged_bytes=\(offset)")
+
+        verboseLog("[SELF_REFRESH] AFC_FILE_CLOSE_START")
+        closeNeeded = false
+        if let closeError = afc_file_close(fileHandle) {
+            let message = self.getErrorMessage(from: closeError)
+            idevice_error_free(closeError)
+            throw IdeviceGatewayError(.serviceError, reason: "AFC file close failed: \(message)")
+        }
+        verboseLog("[SELF_REFRESH] AFC_FILE_CLOSE_PASS")
+
+        let (_, stagedSize) = try self.afcGetFileInfo(client: client, path: path)
+        let sizeMatches = stagedSize == Int64(fileData.count)
+        verboseLog("[SELF_REFRESH] STAGED_FILE_SIZE=\(stagedSize)")
+        verboseLog("[SELF_REFRESH] STAGED_FILE_SIZE_MATCH=\(sizeMatches)")
+        guard sizeMatches else {
+            throw IdeviceGatewayError(
+                .serviceError,
+                reason: "Staged file size mismatch: expected \(fileData.count), got \(stagedSize)"
+            )
         }
     }
 
     private func syncsendAppBundleAfc(bundleId: String, appURL: URL) throws {
+        stagedBundleIdentities.removeValue(forKey: bundleId)
+        let infoData = try Data(contentsOf: appURL.appendingPathComponent("Info.plist"))
+        guard let info = try PropertyListSerialization.propertyList(from: infoData, options: [], format: nil) as? [String: Any],
+              let signedIdentifier = info["CFBundleIdentifier"] as? String,
+              !signedIdentifier.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw IdeviceGatewayError(.serviceError, reason: "Staged app Info.plist has no valid CFBundleIdentifier")
+        }
         debugLog("[IdeviceGateway] sendAppBundleAfc() called, bundleId: \(bundleId), appURL: \(appURL.path)")
         try verifyInitialized()
         try performWithEitherService(
@@ -1164,41 +1386,20 @@ public final class IdeviceGateway: BaseDeviceGateway, DeviceGatewayAPI, @uncheck
                         afc_make_directory(client, pathPtr)
                     }
                 } else {
-                    var fileHandle: OpaquePointer? = nil
-                    let openErr = remoteItemPath.withCString { pathPtr in
-                        afc_file_open(client, pathPtr, AfcFopenMode(rawValue: 4), &fileHandle)
-                    }
-                    if let openErr = openErr {
-                        let msg = self.getErrorMessage(from: openErr)
-                        defer { idevice_error_free(openErr) }
-                        throw IdeviceGatewayError(.serviceError, reason: "Failed to open remote AFC file \(remoteItemPath): \(msg)")
-                    }
-                    defer {
-                        if let fileHandle = fileHandle {
-                            afc_file_close(fileHandle)
-                        }
-                    }
-
                     let fileData = try Data(contentsOf: fileURL, options: .alwaysMapped)
-                    if !fileData.isEmpty {
-                        try fileData.withUnsafeBytes { (buf: UnsafeRawBufferPointer) in
-                            if let baseAddress = buf.baseAddress?.assumingMemoryBound(to: UInt8.self) {
-                                let writeErr = afc_file_write(fileHandle, baseAddress, fileData.count)
-                                if let writeErr = writeErr {
-                                    let msg = self.getErrorMessage(from: writeErr)
-                                    defer { idevice_error_free(writeErr) }
-                                    throw IdeviceGatewayError(.serviceError, reason: "Failed to write to AFC file \(remoteItemPath): \(msg)")
-                                }
-                            }
-                        }
-                    }
+                    try writeVerifiedBundleFile(client: client, path: remoteItemPath, fileData: fileData)
                 }
             }
+            stagedBundleIdentities[bundleId] = (appName: appURL.lastPathComponent, signedIdentifier: signedIdentifier)
+            debugLog("[SELF_REFRESH] SIDESTORE_STAGE_PASS bundle_id=\\(bundleId) format=app")
             debugLog("[IdeviceGateway] sendAppBundleAfc() uploaded \(appURL.lastPathComponent) successfully")
         }
     }
 
     private func syncInstallAppBundle(bundleId: String, appName: String) throws {
+        guard let stagedIdentity = stagedBundleIdentities[bundleId], stagedIdentity.appName == appName else {
+            throw IdeviceGatewayError(.serviceError, reason: "No successfully staged signed identity for \\(bundleId)/\\(appName); stage the app bundle before installing")
+        }
         debugLog("[IdeviceGateway] installAppBundle() called, bundleId: \(bundleId), appName: \(appName)")
         try verifyInitialized()
         try performWithEitherService(
@@ -1222,6 +1423,9 @@ public final class IdeviceGateway: BaseDeviceGateway, DeviceGatewayAPI, @uncheck
                     throw IdeviceGatewayError(.serviceError, reason: "Failed to install App directory, error: (\(msg))")
                 }
                 debugLog("[IdeviceGateway] installAppBundle() installation_proxy_install succeeded")
+                stagedBundleIdentities.removeValue(forKey: bundleId)
+                debugLog("[SELF_REFRESH] SIDESTORE_INSTALL_COMPLETE bundle_id=\\(bundleId) format=app")
+                try verifyInstalledBundle(client: client, bundleId: stagedIdentity.signedIdentifier)
             }
         }
     }
@@ -1256,6 +1460,7 @@ public final class IdeviceGateway: BaseDeviceGateway, DeviceGatewayAPI, @uncheck
             }
             
             let plistArray = resultPtr.assumingMemoryBound(to: plist_t?.self)
+            defer { idevice_plist_array_free(plistArray, UInt(outLen)) }
             var container = ""
             var bundlePath = ""
             var executableName: String? = nil
@@ -1290,7 +1495,6 @@ public final class IdeviceGateway: BaseDeviceGateway, DeviceGatewayAPI, @uncheck
                     }
                 }
             }
-            free(outResult)
             
             if container.isEmpty || bundlePath.isEmpty {
                 debugLog("[IdeviceGateway] getAppPaths() container or bundlePath is empty")
@@ -2557,84 +2761,98 @@ public final class IdeviceGateway: BaseDeviceGateway, DeviceGatewayAPI, @uncheck
 extension IdeviceGateway {
     public func start(pairingFileContent: String, preferred: PairingProtocol?) async throws {
         try await withFFIDispatch {
-            try self.syncStart(pairingFileContent: pairingFileContent, preferred: preferred)
+            defer { self.releaseTransportIfIdle() }
+            return try self.syncStart(pairingFileContent: pairingFileContent, preferred: preferred)
         }
     }
 
     public func fetchUDID() async throws -> String {
         try await withFFIDispatch {
-            try self.syncFetchUDID()
+            defer { self.releaseTransportIfIdle() }
+            return try self.syncFetchUDID()
         }
     }
 
     public func getLockdownValue(key: String) async throws -> String {
         try await withFFIDispatch {
-            try self.syncGetLockdownValue(key: key)
+            defer { self.releaseTransportIfIdle() }
+            return try self.syncGetLockdownValue(key: key)
         }
     }
 
     public func installProvisioningProfile(profile: Data) async throws {
         try await withFFIDispatch {
-            try self.syncInstallProvisioningProfile(profile: profile)
+            defer { self.releaseTransportIfIdle() }
+            return try self.syncInstallProvisioningProfile(profile: profile)
         }
     }
 
     public func removeProvisioningProfile(id: String) async throws {
         try await withFFIDispatch {
-            try self.syncRemoveProvisioningProfile(id: id)
+            defer { self.releaseTransportIfIdle() }
+            return try self.syncRemoveProvisioningProfile(id: id)
         }
     }
 
     public func removeApp(bundleId: String) async throws {
         try await withFFIDispatch {
-            try self.syncRemoveApp(bundleId: bundleId)
+            defer { self.releaseTransportIfIdle() }
+            return try self.syncRemoveApp(bundleId: bundleId)
         }
     }
 
     public func sendIpaAfc(bundleId: String, ipaBytes: Data) async throws {
         try await withFFIDispatch {
-            try self.syncsendIpaAfc(bundleId: bundleId, ipaBytes: ipaBytes)
+            defer { self.releaseTransportIfIdle() }
+            return try self.syncsendIpaAfc(bundleId: bundleId, ipaBytes: ipaBytes)
         }
     }
 
     public func sendAppBundleAfc(bundleId: String, appURL: URL) async throws {
         try await withFFIDispatch {
-            try self.syncsendAppBundleAfc(bundleId: bundleId, appURL: appURL)
+            defer { self.releaseTransportIfIdle() }
+            return try self.syncsendAppBundleAfc(bundleId: bundleId, appURL: appURL)
         }
     }
 
     public func installIpa(bundleId: String) async throws {
         try await withFFIDispatch {
-            try self.syncInstallIpa(bundleId: bundleId)
+            defer { self.releaseTransportIfIdle() }
+            return try self.syncInstallIpa(bundleId: bundleId)
         }
     }
 
     public func installAppBundle(bundleId: String, appName: String) async throws {
         try await withFFIDispatch {
-            try self.syncInstallAppBundle(bundleId: bundleId, appName: appName)
+            defer { self.releaseTransportIfIdle() }
+            return try self.syncInstallAppBundle(bundleId: bundleId, appName: appName)
         }
     }
 
     public func debugApp(appId: String) async throws {
         try await withFFIDispatch {
-            try self.syncDebugApp(appId: appId)
+            defer { self.releaseTransportIfIdle() }
+            return try self.syncDebugApp(appId: appId)
         }
     }
 
     public func debugProcess(pid: UInt32) async throws {
         try await withFFIDispatch {
-            try self.syncDebugProcess(pid: pid)
+            defer { self.releaseTransportIfIdle() }
+            return try self.syncDebugProcess(pid: pid)
         }
     }
 
     public func dumpProfiles(docsPath: String) async throws -> String {
         try await withFFIDispatch {
-            try self.syncDumpProfiles(docsPath: docsPath)
+            defer { self.releaseTransportIfIdle() }
+            return try self.syncDumpProfiles(docsPath: docsPath)
         }
     }
 
     public func performHeartbeat(interval: UInt64) async throws -> UInt64 {
         try await withFFIDispatch {
+            defer { self.releaseTransportIfIdle() }
             var newInterval: UInt64 = 0
             try self.syncPerformHeartbeat(interval: interval, newInterval: &newInterval)
             return newInterval > 0 ? newInterval : 1000
@@ -2643,19 +2861,22 @@ extension IdeviceGateway {
 
     public func mountPersonalizedDdi(image: Data, trustcache: Data, manifest: Data) async throws {
         try await withFFIDispatch {
-            try self.syncMountPersonalizedDdi(image: image, trustcache: trustcache, manifest: manifest)
+            defer { self.releaseTransportIfIdle() }
+            return try self.syncMountPersonalizedDdi(image: image, trustcache: trustcache, manifest: manifest)
         }
     }
 
     public func isDDIMounted() async throws -> Bool {
         try await withFFIDispatch {
-            try self.syncIsDDIMounted()
+            defer { self.releaseTransportIfIdle() }
+            return try self.syncIsDDIMounted()
         }
     }
 
     public func mountDeveloperImage(image: Data, signature: Data) async throws {
         try await withFFIDispatch {
-            try self.syncMountDeveloperImage(image: image, signature: signature)
+            defer { self.releaseTransportIfIdle() }
+            return try self.syncMountDeveloperImage(image: image, signature: signature)
         }
     }
 
@@ -2668,7 +2889,8 @@ extension IdeviceGateway {
         onPin: @escaping @Sendable (String) -> Void
     ) async throws -> PairedDeviceRecord {
         try await withFFIDispatch {
-            try self.syncStartWirelessPair(
+            defer { self.releaseTransportIfIdle() }
+            return try self.syncStartWirelessPair(
                 hostName: hostName,
                 hostModel: hostModel,
                 outPath: outPath,
@@ -2689,7 +2911,8 @@ extension IdeviceGateway {
         onRequestPin: @escaping @Sendable (@escaping @Sendable (String) -> Void) -> Void
     ) async throws -> PairedDeviceRecord {
         try await withFFIDispatch {
-            try self.syncTriggerWirelessPair(
+            defer { self.releaseTransportIfIdle() }
+            return try self.syncTriggerWirelessPair(
                 targetIp: targetIp,
                 targetPort: targetPort,
                 hostName: hostName,
@@ -2703,25 +2926,29 @@ extension IdeviceGateway {
 
     public func afcListDirectory(bundleId: String, path: String) async throws -> [String] {
         try await withFFIDispatch {
-            try self.syncAfcListDirectory(bundleId: bundleId, path: path)
+            defer { self.releaseTransportIfIdle() }
+            return try self.syncAfcListDirectory(bundleId: bundleId, path: path)
         }
     }
 
     public func afcReadFile(bundleId: String, path: String) async throws -> Data {
         try await withFFIDispatch {
-            try self.syncAfcReadFile(bundleId: bundleId, path: path)
+            defer { self.releaseTransportIfIdle() }
+            return try self.syncAfcReadFile(bundleId: bundleId, path: path)
         }
     }
 
     public func afcGetFileInfo(bundleId: String, path: String) async throws -> (isDirectory: Bool, fileSize: Int64) {
         try await withFFIDispatch {
-            try self.syncAfcGetFileInfo(bundleId: bundleId, path: path)
+            defer { self.releaseTransportIfIdle() }
+            return try self.syncAfcGetFileInfo(bundleId: bundleId, path: path)
         }
     }
 
     public func wipeContainer(identifier: String) async throws {
         try await withFFIDispatch {
-            try self.syncWipeContainer(identifier: identifier)
+            defer { self.releaseTransportIfIdle() }
+            return try self.syncWipeContainer(identifier: identifier)
         }
     }
 }

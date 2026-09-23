@@ -21,6 +21,17 @@ private let ffiDispatchQueue = DispatchQueue(
     autoreleaseFrequency: .workItem
 )
 
+/// Synchronous variant of withFFIDispatch for non-async callers such as
+/// protocol property getters. Blocks the calling thread until the FFI serial
+/// queue runs the body. Must never be called from within a withFFIDispatch
+/// body: the queue is serial and that would deadlock.
+@inline(__always)
+public func withFFIDispatchSync<T: Sendable>(
+    _ body: @escaping @Sendable () throws -> T
+) rethrows -> T {
+    try ffiDispatchQueue.sync(execute: body)
+}
+
 @inline(__always)
 public func withFFIDispatch<T: Sendable>(
     _ body: @escaping @Sendable () throws -> T
