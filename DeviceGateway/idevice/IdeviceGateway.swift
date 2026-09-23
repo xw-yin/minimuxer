@@ -534,18 +534,18 @@ public final class IdeviceGateway: BaseDeviceGateway, DeviceGatewayAPI, @uncheck
                       let client = self.heartbeatClient else { return true }
                 var newInterval: UInt64 = 0
                 if let marcoError = heartbeat_get_marco(client, 60, &newInterval) {
-                    let message = getErrorMessage(from: marcoError)
+                    let message = self.getErrorMessage(from: marcoError)
                     idevice_error_free(marcoError)
                     self.noteHeartbeatFailure(generation: generation, reason: "marco: \(message)")
                     return true
                 }
                 if let poloError = heartbeat_send_polo(client) {
-                    let message = getErrorMessage(from: poloError)
+                    let message = self.getErrorMessage(from: poloError)
                     idevice_error_free(poloError)
                     self.noteHeartbeatFailure(generation: generation, reason: "polo: \(message)")
                     return true
                 }
-                verboseLog("[SIDESTORE_COREDEVICE] HEARTBEAT_POLO_PASS")
+                self.verboseLog("[SIDESTORE_COREDEVICE] HEARTBEAT_POLO_PASS")
                 return false
             }) ?? true
             if failed { break }
