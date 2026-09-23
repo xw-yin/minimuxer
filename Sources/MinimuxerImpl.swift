@@ -97,6 +97,15 @@ final internal class MinimuxerImpl: MinimuxerAPI {
     func getConnectionMode() async -> DeviceConnectionMode {
         await self.connectionManager.getPreferredConnectionMode()
     }
+
+    // Transport batch lease: held by refresh pipelines so the CoreDevice
+    // transport is not torn down between operations. Upgraded by M6 to
+    // re-run transport selection when a batch begins.
+    func beginTransportBatch() async {
+        await gateway.beginTransportBatch()
+    }
+
+    func endTransportBatch() async { await gateway.endTransportBatch() }
     
     func bindConnectionConfig(_ binding: ConnectionConfigBinding) async {
         await self.connectionManager.bindConnectionConfig(binding)

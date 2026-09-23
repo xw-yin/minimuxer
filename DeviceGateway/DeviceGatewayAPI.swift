@@ -24,6 +24,12 @@ public struct PairedDeviceRecord: Sendable {
 }
 
 public protocol DeviceGatewayAPI: AnyObject, Sendable {
+    var supportsCoreDeviceTransport: Bool { get }
+    var coreDeviceTransportEnabled: Bool { get }
+    var hasActiveTransportBatch: Bool { get }
+    func configureCoreDeviceTransport(_ enabled: Bool)
+    func beginTransportBatch() async
+    func endTransportBatch() async
     var requiresUsbmuxd: Bool { get }
     var pairingFileType: PairingProtocol { get }
     var pairingFileData: Data? { get }
@@ -84,6 +90,12 @@ public protocol DeviceGatewayAPI: AnyObject, Sendable {
 }
 
 public extension DeviceGatewayAPI {
+    var supportsCoreDeviceTransport: Bool { false }
+    var coreDeviceTransportEnabled: Bool { false }
+    var hasActiveTransportBatch: Bool { false }
+    func configureCoreDeviceTransport(_ enabled: Bool) {}
+    func beginTransportBatch() async {}
+    func endTransportBatch() async {}
     func start(pairingFileContent: String, preferred: PairingProtocol? = nil) async throws {
         try await start(pairingFileContent: pairingFileContent, preferred: preferred)
     }
