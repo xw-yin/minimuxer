@@ -442,6 +442,10 @@ public final class IdeviceGateway: BaseDeviceGateway, DeviceGatewayAPI, @uncheck
             if abandoned.isSet {
                 if let handshake = result.handshake { rsd_handshake_free(handshake) }
                 if let adapter = result.adapter { adapter_free(adapter) }
+                // Late completion owns the provider after a timeout: the FFI
+                // queue detached it instead of freeing it, because
+                // tunnel_create_usb may still have been using it.
+                idevice_provider_free(provider)
                 result.adapter = nil
                 result.handshake = nil
             }
@@ -449,6 +453,10 @@ public final class IdeviceGateway: BaseDeviceGateway, DeviceGatewayAPI, @uncheck
         }
         guard semaphore.wait(timeout: .now() + Self.coreDeviceBuildTimeout) == .success else {
             abandoned.set()
+            // Ownership of the provider passes to the late build completion
+            // above: it may still be running tunnel_create_usb with this
+            // pointer, so releaseTransport() in the caller must not free it.
+            coreDeviceProvider = nil
             throw IdeviceGatewayError(.connectionFailed, reason: "CoreDevice tunnel timed out after 65s")
         }
         if let tunnelError = result.error {
