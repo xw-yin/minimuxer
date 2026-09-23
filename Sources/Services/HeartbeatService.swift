@@ -62,6 +62,13 @@ final internal class HeartbeatService {
         }
 
         verboseLog("[minimuxer] Starting heartbeat task...")
+        // The CoreDevice transport owns its Marco/Polo heartbeat on the
+        // gateway; a second probe loop would open a duplicate heartbeat
+        // client on the same tunnel.
+        if gateway.coreDeviceTransportEnabled {
+            verboseLog("[SIDESTORE_COREDEVICE] HEARTBEAT_PROBE_SKIPPED reason=coredevice_owns_heartbeat")
+            return
+        }
         Task.detached { [weak self] in
             guard let self = self else { return }
             verboseLog("[minimuxer] heartbeat-task: started")
