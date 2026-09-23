@@ -149,6 +149,9 @@ extension DeviceGatewayError {
         if isVPNDrop {
             return .invalidVPN(reason)
         }
-        return catchAll(reason)
+        // Never propagate an empty reason: fall back to the human-readable
+        // description so callers don't end up with messages like "CreateMisagent: ".
+        let message = reason.isEmpty ? (errorDescription ?? code.rawValue) : reason
+        return catchAll(message)
     }
 }
