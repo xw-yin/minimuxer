@@ -126,7 +126,8 @@ public enum PairingFileParser {
         let hasLockdown = missingLockdown.isEmpty
 
         if hasRemoteRP && hasLockdown {
-            throw PairingError.ambiguous("The pairing file contains credentials for both Remote Pairing and Lockdown protocols. Specify a preferred protocol to resolve ambiguity.")
+            // Composite records must use Lockdown/CoreDevice, not RemotePairing.
+            return .lockdown
         }
 
         if hasRemoteRP {
