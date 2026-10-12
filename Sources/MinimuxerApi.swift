@@ -120,6 +120,7 @@ public protocol MinimuxerAPI: AnyObject {
     func debugApp(appId: String) async throws
     func attachDebugger(pid: UInt32) async throws
     func installProvisioningProfile(profile: Data) async throws
+    func installProvisioningProfiles(profiles: [Data]) async throws
     func removeProvisioningProfile(id: String) async throws
     func dumpProfiles(docsPath: String, mode: ProfileDumpMode) async throws -> String
 
@@ -129,6 +130,12 @@ public protocol MinimuxerAPI: AnyObject {
 }
 
 public extension MinimuxerAPI {
+    func installProvisioningProfiles(profiles: [Data]) async throws {
+        for profile in profiles {
+            try await installProvisioningProfile(profile: profile)
+        }
+    }
+
     func start(pairingFile: String, mountPath: String, preferred: PairingProtocol? = nil) async throws {
         try await start(pairingFile: pairingFile, mountPath: mountPath, preferred: preferred)
     }
