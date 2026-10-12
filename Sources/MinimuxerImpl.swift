@@ -62,6 +62,10 @@ final internal class MinimuxerImpl: MinimuxerAPI {
 
         self.network.onNetworkChanged = { [weak self] in
             guard let self = self else { return }
+            if self.gateway.hasActiveTransportBatch {
+                verboseLog("[minimuxer] [net] skipping status check during active transport batch")
+                return
+            }
             let readyResult = await self.isReady()
             debugLog("[minimuxer] [net] publishing status update to subscribers")
             self.statusSubject.send(readyResult)
@@ -113,7 +117,8 @@ final internal class MinimuxerImpl: MinimuxerAPI {
         let decision = RefreshTransportPolicy.select(
             modernOS: modernOS, mode: mode, pairing: gateway.pairingFileType,
             utun: utun, ipsec: ipsec, coreDeviceSupported: gateway.supportsCoreDeviceTransport)
-        gateway.configureCoreDeviceTransport(decision.transport == .coreDevice)
+        let shouldEnableCoreDevice = (decision.transport == .coreDevice) || (gateway.hasActiveTransportBatch && gateway.coreDeviceTransportEnabled)
+        gateway.configureCoreDeviceTransport(shouldEnableCoreDevice)
         // Interface presence cannot establish the identity of the App Store VPN.
         debugLog("[SIDESTORE_COREDEVICE] TRANSPORT_SELECTION os_version=\(ProcessInfo.processInfo.operatingSystemVersionString) pairing_mode=\(gateway.pairingFileType) localdevvpn_detected=unverified utun_detected=\(utun) ipsec_interface_detected=\(ipsec) selected_transport=\(decision.transport.rawValue) reason=\(decision.reason)")
         return decision

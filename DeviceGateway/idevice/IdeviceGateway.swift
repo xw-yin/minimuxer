@@ -85,17 +85,19 @@ public final class IdeviceGateway: BaseDeviceGateway, DeviceGatewayAPI, @uncheck
     private var coreDeviceEnabled = false
     private var usesCoreDevice: Bool { coreDeviceEnabled && pairingFileType == .lockdown }
 
-    // Swift-owned Marco/Polo heartbeat. The pinned IDevice binary's
-    // tunnel_create_usb runs no internal heartbeat, so the gateway maintains
-    // one on a dedicated task. All state below is owned by the global FFI
-    // serial queue; the loop task only touches it through withFFIDispatch.
-    // A dead heartbeat never tears the tunnel down silently: the loop marks
-    // heartbeatActive = false and the next operation rebuilds via
-    // ensureCoreDeviceConnection().
-    private var heartbeatClient: OpaquePointer? = nil
-    private var heartbeatTask: Task<Void, Never>? = nil
+    // Swift-owned Marco/Polo heartbeats (CoreDevice RSD + Classic Lockdown).
+    // Each heartbeat answers the initial Marco/Polo synchronously before
+    // returning so lockdownd/remoted marks the session active before secondary
+    // services (such as misagent or CoreDeviceProxy) connect, and then transfers
+    // exclusive ownership of its HeartbeatClientHandle to a dedicated queue so
+    // ongoing Marco/Polo exchanges never block or starve on ffiDispatchQueue.
+    private let heartbeatStateLock = NSLock()
+    private let coreDeviceHeartbeatQueue = DispatchQueue(label: "com.sidestore.minimuxer.coredevice-heartbeat", qos: .userInitiated)
+    private let lockdownHeartbeatQueue = DispatchQueue(label: "com.sidestore.minimuxer.lockdown-heartbeat", qos: .userInitiated)
     private var heartbeatActive = false
     private var heartbeatGeneration: UInt = 0
+    private var lockdownHeartbeatActive = false
+    private var lockdownHeartbeatGeneration: UInt = 0
 
     // The blocking tunnel_create_usb call runs here so a wedged handshake
     // cannot stall the shared FFI queue indefinitely. The FFI queue waits on
@@ -184,6 +186,7 @@ public final class IdeviceGateway: BaseDeviceGateway, DeviceGatewayAPI, @uncheck
 
     public override func cleanup() {
         debugLog("[IdeviceGateway] cleanup() called")
+        stopLockdownHeartbeat()
         releaseTransport()
         stagedBundleIdentities.removeAll()
         if let pairingFile = self.pairingFile {
@@ -209,6 +212,7 @@ public final class IdeviceGateway: BaseDeviceGateway, DeviceGatewayAPI, @uncheck
 
     public override func invalidateConnection() {
         debugLog("[IdeviceGateway] invalidateConnection() called - clearing stale adapter and handshake")
+        stopLockdownHeartbeat()
         releaseTransport()
     }
 
@@ -355,13 +359,15 @@ public final class IdeviceGateway: BaseDeviceGateway, DeviceGatewayAPI, @uncheck
 
     private func ensureCoreDeviceConnection() throws {
         do {
-            if adapter != nil, handshake != nil, coreDeviceProvider != nil, heartbeatActive {
+            let rsdHeartbeatAlive = isCoreDeviceHeartbeatActive()
+            if adapter != nil, handshake != nil, coreDeviceProvider != nil, rsdHeartbeatAlive {
+                ensureLockdownHeartbeatIfNeeded()
                 verboseLog("[SIDESTORE_COREDEVICE] TRANSPORT_REUSE")
                 return
             }
 
             if adapter != nil || handshake != nil || coreDeviceProvider != nil {
-                debugLog("[SIDESTORE_COREDEVICE] TRANSPORT_STALE heartbeat_active=\(heartbeatActive)")
+                debugLog("[SIDESTORE_COREDEVICE] TRANSPORT_STALE heartbeat_active=\(rsdHeartbeatAlive)")
                 releaseTransport()
             }
 
@@ -374,6 +380,11 @@ public final class IdeviceGateway: BaseDeviceGateway, DeviceGatewayAPI, @uncheck
             guard let data = pairingFileData else {
                 throw IdeviceGatewayError(.invalidPairingFile, reason: "Lockdown pairing data is unavailable")
             }
+
+            // Ensure Classic Lockdown heartbeat (com.apple.mobile.heartbeat) is active
+            // before starting CoreDeviceProxy so lockdownd does not drop secondary
+            // Lockdown service sockets over LocalDevVPN.
+            ensureLockdownHeartbeatIfNeeded()
 
             debugLog("[SIDESTORE_COREDEVICE] TRANSPORT_CREATE_START endpoint=\(endpoint) port=\(getPort(for: .lockdown))")
             var providerPairing: OpaquePointer? = nil
@@ -471,9 +482,48 @@ public final class IdeviceGateway: BaseDeviceGateway, DeviceGatewayAPI, @uncheck
         handshake = result.handshake
     }
 
-    /// Connects the Swift-owned Marco/Polo heartbeat and starts its watchdog
-    /// loop. Called synchronously on the FFI queue, so heartbeatActive is
-    /// already accurate when ensureCoreDeviceConnection() returns.
+    private func isCoreDeviceHeartbeatActive(generation: UInt? = nil) -> Bool {
+        heartbeatStateLock.withLock {
+            if let generation {
+                return heartbeatActive && heartbeatGeneration == generation
+            }
+            return heartbeatActive
+        }
+    }
+
+    private func activateCoreDeviceHeartbeat() -> UInt {
+        heartbeatStateLock.withLock {
+            heartbeatGeneration &+= 1
+            heartbeatActive = true
+            return heartbeatGeneration
+        }
+    }
+
+    private func stopCoreDeviceHeartbeat() {
+        heartbeatStateLock.withLock {
+            heartbeatGeneration &+= 1
+            heartbeatActive = false
+        }
+    }
+
+    /// Marks the heartbeat dead without tearing down the transport handles.
+    /// Watchdog: the next operation's ensureCoreDeviceConnection() rebuilds
+    /// the transport instead of letting the tunnel die silently.
+    private func noteHeartbeatFailure(generation: UInt, reason: String) {
+        let didMarkDead: Bool = heartbeatStateLock.withLock {
+            guard generation == heartbeatGeneration else { return false }
+            heartbeatActive = false
+            return true
+        }
+        if didMarkDead {
+            debugLog("[SIDESTORE_COREDEVICE] HEARTBEAT_FAIL reason=\(reason)")
+        }
+    }
+
+    /// Connects the Swift-owned Marco/Polo RSD heartbeat, answers the initial
+    /// Marco synchronously so remoted marks the host heartbeat active before
+    /// any RSD service (e.g. misagent) connects, and hands the client handle to
+    /// coreDeviceHeartbeatQueue for continuous non-blocking Marco/Polo replies.
     private func startCoreDeviceHeartbeat() throws {
         stopCoreDeviceHeartbeat()
         guard let adapter, let handshake else {
@@ -488,70 +538,204 @@ public final class IdeviceGateway: BaseDeviceGateway, DeviceGatewayAPI, @uncheck
         guard let client else {
             throw IdeviceGatewayError(.connectionFailed, reason: "CoreDevice heartbeat connect returned nil")
         }
-        heartbeatClient = client
-        heartbeatActive = true
-        heartbeatGeneration &+= 1
-        let generation = heartbeatGeneration
-        verboseLog("[SIDESTORE_COREDEVICE] HEARTBEAT_START")
-        heartbeatTask = Task.detached { [weak self] in
-            await self?.runCoreDeviceHeartbeatLoop(generation: generation)
-        }
-    }
 
-    private func stopCoreDeviceHeartbeat() {
-        heartbeatGeneration &+= 1
-        heartbeatTask?.cancel()
-        heartbeatTask = nil
-        if let client = heartbeatClient {
+        var initialInterval: UInt64 = 0
+        if let marcoError = heartbeat_get_marco(client, 15, &initialInterval) {
+            let message = getErrorMessage(from: marcoError)
+            idevice_error_free(marcoError)
             heartbeat_client_free(client)
-            heartbeatClient = nil
+            throw IdeviceGatewayError(.connectionFailed, reason: "CoreDevice initial heartbeat marco failed: \(message)")
         }
-        heartbeatActive = false
-    }
-
-    /// Marks the heartbeat dead without tearing down the transport handles.
-    /// Watchdog: the next operation's ensureCoreDeviceConnection() rebuilds
-    /// the transport instead of letting the tunnel die silently.
-    private func noteHeartbeatFailure(generation: UInt, reason: String) {
-        guard generation == heartbeatGeneration else { return }
-        debugLog("[SIDESTORE_COREDEVICE] HEARTBEAT_FAIL reason=\(reason)")
-        if let client = heartbeatClient {
+        if let poloError = heartbeat_send_polo(client) {
+            let message = getErrorMessage(from: poloError)
+            idevice_error_free(poloError)
             heartbeat_client_free(client)
-            heartbeatClient = nil
+            throw IdeviceGatewayError(.connectionFailed, reason: "CoreDevice initial heartbeat polo failed: \(message)")
         }
-        heartbeatActive = false
+
+        let generation = activateCoreDeviceHeartbeat()
+        let firstWait = min(max(initialInterval > 0 ? initialInterval : 15, 5), 30) + 5
+        verboseLog("[SIDESTORE_COREDEVICE] HEARTBEAT_START interval=\(initialInterval)s")
+        coreDeviceHeartbeatQueue.async { [weak self] in
+            defer { heartbeat_client_free(client) }
+            self?.runCoreDeviceHeartbeatLoop(client: client, generation: generation, initialWaitSeconds: firstWait)
+        }
     }
 
-    /// Marco/Polo loop. Answers the initial Marco immediately upon connection
-    /// and then sleeps for the device-provided interval (clamped to 5...25s).
-    /// All FFI and state access goes through withFFIDispatch so the loop can
-    /// never race transport teardown on the FFI serial queue.
-    private func runCoreDeviceHeartbeatLoop(generation: UInt) async {
-        while !Task.isCancelled {
-            let (failed, sleepSeconds): (Bool, UInt64) = (try? await withFFIDispatch { () -> (Bool, UInt64) in
-                guard generation == self.heartbeatGeneration,
-                      let client = self.heartbeatClient else { return (true, 10) }
-                var newInterval: UInt64 = 0
-                if let marcoError = heartbeat_get_marco(client, 20, &newInterval) {
-                    let message = self.getErrorMessage(from: marcoError)
-                    idevice_error_free(marcoError)
-                    self.noteHeartbeatFailure(generation: generation, reason: "marco: \(message)")
-                    return (true, 10)
-                }
-                if let poloError = heartbeat_send_polo(client) {
-                    let message = self.getErrorMessage(from: poloError)
-                    idevice_error_free(poloError)
-                    self.noteHeartbeatFailure(generation: generation, reason: "polo: \(message)")
-                    return (true, 10)
-                }
-                let nextSleep = min(max(newInterval > 0 ? newInterval : 10, 5), 25)
-                verboseLog("[SIDESTORE_COREDEVICE] HEARTBEAT_POLO_PASS interval=\(nextSleep)s")
-                return (false, nextSleep)
-            }) ?? (true, 10)
-            if failed || Task.isCancelled { break }
-            try? await Task.sleep(nanoseconds: sleepSeconds * 1_000_000_000)
+    /// Continuous Marco/Polo loop on coreDeviceHeartbeatQueue.
+    /// Note: heartbeat_get_marco itself blocks on read_plist() waiting for the
+    /// device's next Marco message, so no additional sleep should be inserted.
+    private func runCoreDeviceHeartbeatLoop(client: OpaquePointer, generation: UInt, initialWaitSeconds: UInt64) {
+        var waitSeconds = initialWaitSeconds
+        while isCoreDeviceHeartbeatActive(generation: generation) {
+            var newInterval: UInt64 = 0
+            if let marcoError = heartbeat_get_marco(client, waitSeconds, &newInterval) {
+                let message = getErrorMessage(from: marcoError)
+                idevice_error_free(marcoError)
+                noteHeartbeatFailure(generation: generation, reason: "marco: \(message)")
+                break
+            }
+            guard isCoreDeviceHeartbeatActive(generation: generation) else { break }
+            if let poloError = heartbeat_send_polo(client) {
+                let message = getErrorMessage(from: poloError)
+                idevice_error_free(poloError)
+                noteHeartbeatFailure(generation: generation, reason: "polo: \(message)")
+                break
+            }
+            waitSeconds = min(max(newInterval > 0 ? newInterval : 15, 5), 30) + 5
+            verboseLog("[SIDESTORE_COREDEVICE] HEARTBEAT_POLO_PASS interval=\(newInterval)s")
         }
         verboseLog("[SIDESTORE_COREDEVICE] HEARTBEAT_LOOP_EXIT")
+    }
+
+    private func isLockdownHeartbeatActive(generation: UInt? = nil) -> Bool {
+        heartbeatStateLock.withLock {
+            if let generation {
+                return lockdownHeartbeatActive && lockdownHeartbeatGeneration == generation
+            }
+            return lockdownHeartbeatActive
+        }
+    }
+
+    private func activateLockdownHeartbeat() -> UInt {
+        heartbeatStateLock.withLock {
+            lockdownHeartbeatGeneration &+= 1
+            lockdownHeartbeatActive = true
+            return lockdownHeartbeatGeneration
+        }
+    }
+
+    private func stopLockdownHeartbeat() {
+        heartbeatStateLock.withLock {
+            lockdownHeartbeatGeneration &+= 1
+            lockdownHeartbeatActive = false
+        }
+    }
+
+    private func noteLockdownHeartbeatFailure(generation: UInt, reason: String) {
+        let didMarkDead: Bool = heartbeatStateLock.withLock {
+            guard generation == lockdownHeartbeatGeneration else { return false }
+            lockdownHeartbeatActive = false
+            return true
+        }
+        if didMarkDead {
+            debugLog("[IdeviceGateway] Lockdown heartbeat ended: \(reason)")
+        }
+    }
+
+    /// Ensures Classic Lockdown heartbeat (com.apple.mobile.heartbeat) is active
+    /// and has completed its initial Marco/Polo handshake before any secondary
+    /// Lockdown service (misagent, CoreDeviceProxy, AFC, etc.) connects.
+    private func ensureLockdownHeartbeatIfNeeded() {
+        guard pairingFileType == .lockdown else { return }
+        if isLockdownHeartbeatActive() { return }
+        do {
+            try startLockdownHeartbeat()
+        } catch {
+            debugLog("[IdeviceGateway] Lockdown heartbeat start warning: \(error.localizedDescription)")
+        }
+    }
+
+    private func startLockdownHeartbeat() throws {
+        stopLockdownHeartbeat()
+        guard pairingFileType == .lockdown else { return }
+        guard let endpoint = deviceEndpointIp else {
+            throw IdeviceGatewayError(.deviceEndpointIpNotAvailable)
+        }
+        guard let data = pairingFileData else {
+            throw IdeviceGatewayError(.invalidPairingFile, reason: "Lockdown pairing data is unavailable")
+        }
+
+        var tempPairing: OpaquePointer? = nil
+        let parseErr = data.withUnsafeBytes { bytes in
+            idevice_pairing_file_from_bytes(
+                bytes.baseAddress?.assumingMemoryBound(to: UInt8.self),
+                UInt(data.count),
+                &tempPairing
+            )
+        }
+        if let parseErr {
+            let message = getErrorMessage(from: parseErr)
+            safeFreeError(parseErr)
+            throw IdeviceGatewayError(.invalidPairingFile, reason: "Lockdown heartbeat pairing parse failed: \(message)")
+        }
+        guard let tempPairing else {
+            throw IdeviceGatewayError(.invalidPairingFile, reason: "Lockdown heartbeat pairing parse returned nil")
+        }
+
+        var pairingConsumed = false
+        defer { if !pairingConsumed { idevice_pairing_file_free(tempPairing) } }
+        var provider: OpaquePointer? = nil
+        var providerErr: UnsafeMutablePointer<IdeviceFfiError>? = nil
+        try MinimuxerConstants.appName.withCString { label in
+            try withSockaddr(ip: endpoint, port: getPort(for: .lockdown)) { address, _ in
+                pairingConsumed = true
+                providerErr = idevice_tcp_provider_new(address, tempPairing, label, &provider)
+            }
+        }
+        if let providerErr {
+            let message = getErrorMessage(from: providerErr)
+            safeFreeError(providerErr)
+            throw IdeviceGatewayError(.connectionFailed, reason: "Lockdown heartbeat provider failed: \(message)")
+        }
+        guard let provider else {
+            throw IdeviceGatewayError(.connectionFailed, reason: "Lockdown heartbeat provider returned nil")
+        }
+        defer { idevice_provider_free(provider) }
+
+        var client: OpaquePointer? = nil
+        if let connectErr = heartbeat_connect(provider, &client) {
+            let message = getErrorMessage(from: connectErr)
+            safeFreeError(connectErr)
+            throw IdeviceGatewayError(.connectionFailed, reason: "Lockdown heartbeat connect failed: \(message)")
+        }
+        guard let client else {
+            throw IdeviceGatewayError(.connectionFailed, reason: "Lockdown heartbeat connect returned nil")
+        }
+
+        var initialInterval: UInt64 = 0
+        if let marcoErr = heartbeat_get_marco(client, 15, &initialInterval) {
+            let message = getErrorMessage(from: marcoErr)
+            safeFreeError(marcoErr)
+            heartbeat_client_free(client)
+            throw IdeviceGatewayError(.connectionFailed, reason: "Lockdown initial heartbeat marco failed: \(message)")
+        }
+        if let poloErr = heartbeat_send_polo(client) {
+            let message = getErrorMessage(from: poloErr)
+            safeFreeError(poloErr)
+            heartbeat_client_free(client)
+            throw IdeviceGatewayError(.connectionFailed, reason: "Lockdown initial heartbeat polo failed: \(message)")
+        }
+
+        let generation = activateLockdownHeartbeat()
+        let firstWait = min(max(initialInterval > 0 ? initialInterval : 15, 5), 30) + 5
+        debugLog("[IdeviceGateway] Lockdown heartbeat started (interval=\(initialInterval)s)")
+        lockdownHeartbeatQueue.async { [weak self] in
+            defer { heartbeat_client_free(client) }
+            self?.runLockdownHeartbeatLoop(client: client, generation: generation, initialWaitSeconds: firstWait)
+        }
+    }
+
+    private func runLockdownHeartbeatLoop(client: OpaquePointer, generation: UInt, initialWaitSeconds: UInt64) {
+        var waitSeconds = initialWaitSeconds
+        while isLockdownHeartbeatActive(generation: generation) {
+            var newInterval: UInt64 = 0
+            if let marcoErr = heartbeat_get_marco(client, waitSeconds, &newInterval) {
+                let message = getErrorMessage(from: marcoErr)
+                safeFreeError(marcoErr)
+                noteLockdownHeartbeatFailure(generation: generation, reason: "marco: \(message)")
+                break
+            }
+            guard isLockdownHeartbeatActive(generation: generation) else { break }
+            if let poloErr = heartbeat_send_polo(client) {
+                let message = getErrorMessage(from: poloErr)
+                safeFreeError(poloErr)
+                noteLockdownHeartbeatFailure(generation: generation, reason: "polo: \(message)")
+                break
+            }
+            waitSeconds = min(max(newInterval > 0 ? newInterval : 15, 5), 30) + 5
+            verboseLog("[IdeviceGateway] Lockdown heartbeat polo sent (interval=\(newInterval)s)")
+        }
     }
 
     private func ensureRPConnection() throws {
@@ -560,9 +744,13 @@ public final class IdeviceGateway: BaseDeviceGateway, DeviceGatewayAPI, @uncheck
             return
         }
         debugLog("[IdeviceGateway] ensureRPConnection() started, adapter: \(String(describing: adapter)), handshake: \(String(describing: handshake))")
-        if adapter != nil && handshake != nil {
+        if adapter != nil && handshake != nil && isCoreDeviceHeartbeatActive() {
             verboseLog("[IdeviceGateway] ensureRPConnection() using existing connection")
             return
+        }
+        if adapter != nil || handshake != nil {
+            debugLog("[IdeviceGateway] ensureRPConnection() clearing stale connection")
+            releaseTransport()
         }
 
         guard let pairingFile = pairingFile else {
@@ -618,6 +806,7 @@ public final class IdeviceGateway: BaseDeviceGateway, DeviceGatewayAPI, @uncheck
                 throw error
             }
         }
+        try? startCoreDeviceHeartbeat()
         debugLog("[IdeviceGateway] ensureRPConnection() tunnel_create_rppairing succeeded, adapter: \(String(describing: adapter)), handshake: \(String(describing: handshake))")
     }
 
@@ -943,6 +1132,10 @@ public final class IdeviceGateway: BaseDeviceGateway, DeviceGatewayAPI, @uncheck
                 Thread.sleep(forTimeInterval: 0.15)
             }
 
+            if serviceName != "heartbeat" && serviceName != "lockdownd" {
+                ensureLockdownHeartbeatIfNeeded()
+            }
+
             var tempPairingFile: OpaquePointer? = nil
             let parseErr = pairingFileData.withUnsafeBytes { buf in
                 return idevice_pairing_file_from_bytes(buf.baseAddress?.assumingMemoryBound(to: UInt8.self), UInt(pairingFileData.count), &tempPairingFile)
@@ -970,6 +1163,7 @@ public final class IdeviceGateway: BaseDeviceGateway, DeviceGatewayAPI, @uncheck
                 let error = IdeviceGatewayError(.connectionFailed, reason: "Failed to create TCP provider: \(msg)")
                 lastAttemptError = error
                 if attempt < maxAttempts && isTransientServiceFailureMessage(msg) {
+                    stopLockdownHeartbeat()
                     continue
                 }
                 throw error
@@ -979,6 +1173,7 @@ public final class IdeviceGateway: BaseDeviceGateway, DeviceGatewayAPI, @uncheck
                 let error = IdeviceGatewayError(.connectionFailed, reason: "TCP Provider was nil")
                 lastAttemptError = error
                 if attempt < maxAttempts {
+                    stopLockdownHeartbeat()
                     continue
                 }
                 throw error
@@ -1000,6 +1195,7 @@ public final class IdeviceGateway: BaseDeviceGateway, DeviceGatewayAPI, @uncheck
                 let error = IdeviceGatewayError(.serviceError, reason: "Failed to connect to \(serviceName), error: (\(msg))")
                 lastAttemptError = error
                 if attempt < maxAttempts && isTransientServiceFailureMessage(msg) {
+                    stopLockdownHeartbeat()
                     continue
                 }
                 throw error
@@ -1008,6 +1204,7 @@ public final class IdeviceGateway: BaseDeviceGateway, DeviceGatewayAPI, @uncheck
                 let error = IdeviceGatewayError(.noConnection)
                 lastAttemptError = error
                 if attempt < maxAttempts {
+                    stopLockdownHeartbeat()
                     continue
                 }
                 throw error
@@ -1019,6 +1216,7 @@ public final class IdeviceGateway: BaseDeviceGateway, DeviceGatewayAPI, @uncheck
             } catch let gwErr as IdeviceGatewayError {
                 if attempt < maxAttempts && isTransientServiceFailureMessage(gwErr.reason) {
                     debugLog("[IdeviceGateway] performWithTcpService(\(serviceName)) action failed with transient error on attempt \(attempt)/\(maxAttempts): \(gwErr.reason)")
+                    stopLockdownHeartbeat()
                     lastAttemptError = gwErr
                     continue
                 }
@@ -1036,9 +1234,16 @@ public final class IdeviceGateway: BaseDeviceGateway, DeviceGatewayAPI, @uncheck
         serviceName: String,
         action: (OpaquePointer) throws -> T
     ) throws -> T {
-        debugLog("[IdeviceGateway] performWithEitherService(\(serviceName)) started, mode = .\(pairingFileType)")
-        if pairingFileType == .rppairing || usesCoreDevice {
+        debugLog("[IdeviceGateway] performWithEitherService(\(serviceName)) started, mode = .\(pairingFileType), usesCoreDevice = \(usesCoreDevice)")
+        if pairingFileType == .rppairing {
             return try performWithService(connect: connectRP, cleanup: cleanup, serviceName: serviceName, action: action)
+        } else if usesCoreDevice {
+            do {
+                return try performWithService(connect: connectRP, cleanup: cleanup, serviceName: serviceName, action: action)
+            } catch let gwErr as IdeviceGatewayError where pairingFileType == .lockdown && isTransientServiceFailureMessage(gwErr.reason) {
+                debugLog("[SIDESTORE_COREDEVICE] CoreDevice RSD service (\(serviceName)) failed (\(gwErr.reason)); trying Lockdown TCP service with active Lockdown heartbeat")
+                return try performWithTcpService(connect: connectLockdown, cleanup: cleanup, serviceName: serviceName, action: action)
+            }
         } else {
             do {
                 return try performWithTcpService(connect: connectLockdown, cleanup: cleanup, serviceName: serviceName, action: action)
