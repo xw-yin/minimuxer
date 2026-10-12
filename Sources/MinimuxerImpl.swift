@@ -546,6 +546,12 @@ final internal class MinimuxerImpl: MinimuxerAPI {
         }
     }
 
+    func installProvisioningProfiles(profiles: [Data]) async throws(MinimuxerError) {
+        try await runWithChecks("while installing profiles", catchAll: MinimuxerError.profileInstall) {
+            try await self.gateway.installProvisioningProfiles(profiles: profiles)
+        }
+    }
+
     func removeProvisioningProfile(id: String) async throws(MinimuxerError) {
         try await runWithChecks("while removing profile", catchAll: MinimuxerError.profileRemove) {
             try await self.gateway.removeProvisioningProfile(id: id)

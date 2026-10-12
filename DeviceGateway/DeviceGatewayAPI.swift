@@ -51,6 +51,7 @@ public protocol DeviceGatewayAPI: AnyObject, Sendable {
     func mountPersonalizedDdi(image: Data, trustcache: Data, manifest: Data) async throws
 
     func installProvisioningProfile(profile: Data) async throws
+    func installProvisioningProfiles(profiles: [Data]) async throws
     func removeProvisioningProfile(id: String) async throws
     func dumpProfiles(docsPath: String) async throws -> String
     func removeApp(bundleId: String) async throws
@@ -96,6 +97,11 @@ public extension DeviceGatewayAPI {
     func configureCoreDeviceTransport(_ enabled: Bool) {}
     func beginTransportBatch() async {}
     func endTransportBatch() async {}
+    func installProvisioningProfiles(profiles: [Data]) async throws {
+        for profile in profiles {
+            try await installProvisioningProfile(profile: profile)
+        }
+    }
     func start(pairingFileContent: String, preferred: PairingProtocol? = nil) async throws {
         try await start(pairingFileContent: pairingFileContent, preferred: preferred)
     }

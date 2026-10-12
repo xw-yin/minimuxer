@@ -522,33 +522,34 @@ public final class IdeviceGateway: BaseDeviceGateway, DeviceGatewayAPI, @uncheck
         heartbeatActive = false
     }
 
-    /// Marco/Polo loop. Beats every 60s, well under the 90s RSD timeout.
+    /// Marco/Polo loop. Answers the initial Marco immediately upon connection
+    /// and then sleeps for the device-provided interval (clamped to 5...25s).
     /// All FFI and state access goes through withFFIDispatch so the loop can
     /// never race transport teardown on the FFI serial queue.
     private func runCoreDeviceHeartbeatLoop(generation: UInt) async {
         while !Task.isCancelled {
-            try? await Task.sleep(nanoseconds: 60 * 1_000_000_000)
-            if Task.isCancelled { break }
-            let failed: Bool = (try? await withFFIDispatch { () -> Bool in
+            let (failed, sleepSeconds): (Bool, UInt64) = (try? await withFFIDispatch { () -> (Bool, UInt64) in
                 guard generation == self.heartbeatGeneration,
-                      let client = self.heartbeatClient else { return true }
+                      let client = self.heartbeatClient else { return (true, 10) }
                 var newInterval: UInt64 = 0
-                if let marcoError = heartbeat_get_marco(client, 60, &newInterval) {
+                if let marcoError = heartbeat_get_marco(client, 20, &newInterval) {
                     let message = self.getErrorMessage(from: marcoError)
                     idevice_error_free(marcoError)
                     self.noteHeartbeatFailure(generation: generation, reason: "marco: \(message)")
-                    return true
+                    return (true, 10)
                 }
                 if let poloError = heartbeat_send_polo(client) {
                     let message = self.getErrorMessage(from: poloError)
                     idevice_error_free(poloError)
                     self.noteHeartbeatFailure(generation: generation, reason: "polo: \(message)")
-                    return true
+                    return (true, 10)
                 }
-                verboseLog("[SIDESTORE_COREDEVICE] HEARTBEAT_POLO_PASS")
-                return false
-            }) ?? true
-            if failed { break }
+                let nextSleep = min(max(newInterval > 0 ? newInterval : 10, 5), 25)
+                verboseLog("[SIDESTORE_COREDEVICE] HEARTBEAT_POLO_PASS interval=\(nextSleep)s")
+                return (false, nextSleep)
+            }) ?? (true, 10)
+            if failed || Task.isCancelled { break }
+            try? await Task.sleep(nanoseconds: sleepSeconds * 1_000_000_000)
         }
         verboseLog("[SIDESTORE_COREDEVICE] HEARTBEAT_LOOP_EXIT")
     }
@@ -647,6 +648,21 @@ public final class IdeviceGateway: BaseDeviceGateway, DeviceGatewayAPI, @uncheck
         return false
     }
 
+    private func isTransientServiceFailureMessage(_ message: String) -> Bool {
+        let lower = message.lowercased()
+        return lower.contains("broken pipe") ||
+               lower.contains("os { code: 32") ||
+               lower.contains("connection reset") ||
+               lower.contains("os { code: 54") ||
+               lower.contains("unexpected eof") ||
+               lower.contains("os { code: 57") ||
+               lower.contains("not connected") ||
+               lower.contains("timed out") ||
+               lower.contains("os { code: 60") ||
+               lower.contains("muxererror") ||
+               lower.contains("ioerror")
+    }
+
     private func performWithService<T>(
         connect: @escaping (OpaquePointer?, OpaquePointer?, UnsafeMutablePointer<OpaquePointer?>?) -> UnsafeMutablePointer<IdeviceFfiError>?,
         cleanup: @escaping (OpaquePointer?) -> Void,
@@ -654,71 +670,106 @@ public final class IdeviceGateway: BaseDeviceGateway, DeviceGatewayAPI, @uncheck
         action: (OpaquePointer) throws -> T
     ) throws -> T {
         debugLog("[IdeviceGateway] performWithService(\(serviceName)) started")
-        try ensureRPConnection()
-        var client: OpaquePointer? = nil
-        var err = connect(adapter, handshake, &client)
-        if let firstErr = err {
-            let ffiErr = firstErr.pointee
-            let code = ffiErr.code
-            let subCode = ffiErr.sub_code
-            var msg = ""
-            if let msgPtr = ffiErr.message {
-                msg = String(cString: msgPtr)
+        let maxAttempts = 3
+        var lastAttemptError: IdeviceGatewayError? = nil
+
+        for attempt in 1...maxAttempts {
+            if attempt > 1 {
+                debugLog("[IdeviceGateway] performWithService(\(serviceName)) retry attempt \(attempt)/\(maxAttempts)...")
+                Thread.sleep(forTimeInterval: 0.15)
             }
-            debugLog("[IdeviceGateway] performWithService(\(serviceName)) connect failed with code: \(code), subCode: \(subCode), message: \(msg)")
-            idevice_error_free(firstErr)
-            
-            invalidateConnection()
-            
-            // Retry once with a fresh connection tunnel
-            debugLog("[IdeviceGateway] performWithService(\(serviceName)) retrying with fresh connection...")
+
             do {
                 try ensureRPConnection()
-                err = connect(adapter, handshake, &client)
             } catch let gwErr as IdeviceGatewayError {
+                invalidateConnection()
+                lastAttemptError = gwErr
                 lastError = gwErr
+                if attempt < maxAttempts && gwErr.code != .invalidPairingFile {
+                    continue
+                }
                 throw gwErr
             } catch {
-                let reason = "Service connection retry failed: \(error.localizedDescription)"
+                invalidateConnection()
+                let reason = "Service connection failed: \(error.localizedDescription)"
                 let errObj = IdeviceGatewayError(.serviceError, reason: reason)
+                lastAttemptError = errObj
                 lastError = errObj
+                if attempt < maxAttempts {
+                    continue
+                }
                 throw errObj
             }
-            
-            if let secondErr = err {
-                let ffiErr = secondErr.pointee
+
+            var client: OpaquePointer? = nil
+            let err = connect(adapter, handshake, &client)
+            if let connectErr = err {
+                let ffiErr = connectErr.pointee
                 let code = ffiErr.code
                 let subCode = ffiErr.sub_code
-                var retryMsg = ""
+                var msg = ""
                 if let msgPtr = ffiErr.message {
-                    retryMsg = String(cString: msgPtr)
+                    msg = String(cString: msgPtr)
                 }
-                debugLog("[IdeviceGateway] performWithService(\(serviceName)) retry connect failed with code: \(code), subCode: \(subCode), message: \(retryMsg)")
-                defer { idevice_error_free(secondErr) }
+                debugLog("[IdeviceGateway] performWithService(\(serviceName)) attempt \(attempt)/\(maxAttempts) connect failed with code: \(code), subCode: \(subCode), message: \(msg)")
+                let pairingErr = isPairingError(connectErr)
+                idevice_error_free(connectErr)
                 invalidateConnection()
-                
-                if isPairingError(secondErr) {
-                    let reason = "Service connection failed, error: (\(retryMsg.isEmpty ? "Unknown FFI error" : retryMsg))"
+
+                if pairingErr {
+                    let reason = "Service connection failed, error: (\(msg.isEmpty ? "Unknown FFI error" : msg))"
                     let error = IdeviceGatewayError(.invalidPairingFile, reason: reason)
+                    lastAttemptError = error
                     lastError = error
+                    if attempt < maxAttempts && isTransientServiceFailureMessage(msg) {
+                        continue
+                    }
                     throw error
                 } else {
-                    let error = IdeviceGatewayError(.serviceError, reason: "Failed to connect to \(serviceName), error: (\(retryMsg.isEmpty ? "Unknown FFI error" : retryMsg))")
+                    let error = IdeviceGatewayError(.serviceError, reason: "Failed to connect to \(serviceName), error: (\(msg.isEmpty ? "Unknown FFI error" : msg))")
+                    lastAttemptError = error
                     lastError = error
+                    if attempt < maxAttempts {
+                        continue
+                    }
                     throw error
                 }
             }
+
+            guard let connectedClient = client else {
+                debugLog("[IdeviceGateway] performWithService(\(serviceName)) client is nil on attempt \(attempt)")
+                invalidateConnection()
+                let error = IdeviceGatewayError(.serviceError, reason: "Connected client for \(serviceName) was nil")
+                lastAttemptError = error
+                lastError = error
+                if attempt < maxAttempts {
+                    continue
+                }
+                throw error
+            }
+
+            do {
+                defer {
+                    verboseLog("[IdeviceGateway] performWithService(\(serviceName)) performing cleanup")
+                    cleanup(connectedClient)
+                }
+                verboseLog("[IdeviceGateway] performWithService(\(serviceName)) executing action")
+                return try action(connectedClient)
+            } catch let gwErr as IdeviceGatewayError {
+                if attempt < maxAttempts && isTransientServiceFailureMessage(gwErr.reason) {
+                    debugLog("[IdeviceGateway] performWithService(\(serviceName)) action failed with transient error on attempt \(attempt)/\(maxAttempts): \(gwErr.reason)")
+                    invalidateConnection()
+                    lastAttemptError = gwErr
+                    lastError = gwErr
+                    continue
+                }
+                throw gwErr
+            }
         }
-        guard let client = client else {
-            debugLog("[IdeviceGateway] performWithService(\(serviceName)) client is nil")
-            throw IdeviceGatewayError(.serviceError, reason: "Connected client for \(serviceName) was nil")
-        }
-        defer {
-            verboseLog("[IdeviceGateway] performWithService(\(serviceName)) performing cleanup")
-            cleanup(client)
-        }
-        verboseLog("[IdeviceGateway] performWithService(\(serviceName)) executing action")
-        return try action(client)
+
+        let finalError = lastAttemptError ?? IdeviceGatewayError(.serviceError, reason: "Failed to connect to \(serviceName)")
+        lastError = finalError
+        throw finalError
     }
 
     private func performWithUsbmuxdService<T>(
@@ -877,66 +928,105 @@ public final class IdeviceGateway: BaseDeviceGateway, DeviceGatewayAPI, @uncheck
             debugLog("[IdeviceGateway] performWithTcpService(\(serviceName)) failed because deviceEndpointIp is nil")
             throw IdeviceGatewayError(.deviceEndpointIpNotAvailable)
         }
-        
-
 
         guard let pairingFileData = self.pairingFileData else {
             debugLog("[IdeviceGateway] error: pairingFileData is nil")
             throw IdeviceGatewayError(.connectionFailed, reason: "pairingFileData is nil")
         }
 
-        var tempPairingFile: OpaquePointer? = nil
-        let parseErr = pairingFileData.withUnsafeBytes { buf in
-            return idevice_pairing_file_from_bytes(buf.baseAddress?.assumingMemoryBound(to: UInt8.self), UInt(pairingFileData.count), &tempPairingFile)
-        }
-        if let parseErr = parseErr {
-            let msg = self.getErrorMessage(from: parseErr)
-            debugLog("[IdeviceGateway] error: Failed to parse temporary pairing file: \(msg)")
-            defer { safeFreeError(parseErr) }
-            throw IdeviceGatewayError(.connectionFailed, reason: "Failed to parse temporary pairing file: \(msg)")
-        }
-        guard let tempPairingFile = tempPairingFile else {
-            throw IdeviceGatewayError(.connectionFailed, reason: "Temporary pairing file was nil")
-        }
+        let maxAttempts = 3
+        var lastAttemptError: IdeviceGatewayError? = nil
 
-        var provider: OpaquePointer? = nil
-        let provErr = try withSockaddr(ip: deviceEndpointIp, port: MinimuxerConstants.lockdowndPort) { sockaddrPtr, _ in
-            sockaddrPtr.withMemoryRebound(to: idevice_sockaddr.self, capacity: 1) { reboundPtr in
-                return idevice_tcp_provider_new(reboundPtr, tempPairingFile, MinimuxerConstants.appName, &provider)
+        for attempt in 1...maxAttempts {
+            if attempt > 1 {
+                debugLog("[IdeviceGateway] performWithTcpService(\(serviceName)) retry attempt \(attempt)/\(maxAttempts)...")
+                Thread.sleep(forTimeInterval: 0.15)
+            }
+
+            var tempPairingFile: OpaquePointer? = nil
+            let parseErr = pairingFileData.withUnsafeBytes { buf in
+                return idevice_pairing_file_from_bytes(buf.baseAddress?.assumingMemoryBound(to: UInt8.self), UInt(pairingFileData.count), &tempPairingFile)
+            }
+            if let parseErr = parseErr {
+                let msg = self.getErrorMessage(from: parseErr)
+                debugLog("[IdeviceGateway] error: Failed to parse temporary pairing file: \(msg)")
+                defer { safeFreeError(parseErr) }
+                throw IdeviceGatewayError(.connectionFailed, reason: "Failed to parse temporary pairing file: \(msg)")
+            }
+            guard let tempPairingFile = tempPairingFile else {
+                throw IdeviceGatewayError(.connectionFailed, reason: "Temporary pairing file was nil")
+            }
+
+            var provider: OpaquePointer? = nil
+            let provErr = try withSockaddr(ip: deviceEndpointIp, port: getPort(for: .lockdown)) { sockaddrPtr, _ in
+                sockaddrPtr.withMemoryRebound(to: idevice_sockaddr.self, capacity: 1) { reboundPtr in
+                    return idevice_tcp_provider_new(reboundPtr, tempPairingFile, MinimuxerConstants.appName, &provider)
+                }
+            }
+            if let provErr = provErr {
+                let msg = self.getErrorMessage(from: provErr)
+                debugLog("[IdeviceGateway] error: Failed to create TCP provider: \(msg)")
+                defer { safeFreeError(provErr) }
+                let error = IdeviceGatewayError(.connectionFailed, reason: "Failed to create TCP provider: \(msg)")
+                lastAttemptError = error
+                if attempt < maxAttempts && isTransientServiceFailureMessage(msg) {
+                    continue
+                }
+                throw error
+            }
+            guard let provider = provider else {
+                debugLog("[IdeviceGateway] error: TCP Provider was nil")
+                let error = IdeviceGatewayError(.connectionFailed, reason: "TCP Provider was nil")
+                lastAttemptError = error
+                if attempt < maxAttempts {
+                    continue
+                }
+                throw error
+            }
+            var providerToFree: OpaquePointer? = provider
+            defer {
+                if let ptr = providerToFree {
+                    idevice_provider_free(ptr)
+                }
+            }
+
+            var client: OpaquePointer? = nil
+            let connectErr = connect(provider, &client)
+            if let connectErr = connectErr {
+                providerToFree = nil
+                let msg = self.getErrorMessage(from: connectErr)
+                debugLog("[IdeviceGateway] error: \(serviceName) connect failed (attempt \(attempt)/\(maxAttempts)): code=\(connectErr.pointee.code), message=\(msg)")
+                defer { safeFreeError(connectErr) }
+                let error = IdeviceGatewayError(.serviceError, reason: "Failed to connect to \(serviceName), error: (\(msg))")
+                lastAttemptError = error
+                if attempt < maxAttempts && isTransientServiceFailureMessage(msg) {
+                    continue
+                }
+                throw error
+            }
+            guard let connectedClient = client else {
+                let error = IdeviceGatewayError(.noConnection)
+                lastAttemptError = error
+                if attempt < maxAttempts {
+                    continue
+                }
+                throw error
+            }
+
+            do {
+                defer { cleanup(connectedClient) }
+                return try action(connectedClient)
+            } catch let gwErr as IdeviceGatewayError {
+                if attempt < maxAttempts && isTransientServiceFailureMessage(gwErr.reason) {
+                    debugLog("[IdeviceGateway] performWithTcpService(\(serviceName)) action failed with transient error on attempt \(attempt)/\(maxAttempts): \(gwErr.reason)")
+                    lastAttemptError = gwErr
+                    continue
+                }
+                throw gwErr
             }
         }
-        if let provErr = provErr {
-            let msg = self.getErrorMessage(from: provErr)
-            debugLog("[IdeviceGateway] error: Failed to create TCP provider: \(msg)")
-            defer { safeFreeError(provErr) }
-            throw IdeviceGatewayError(.connectionFailed, reason: "Failed to create TCP provider: \(msg)")
-        }
-        guard let provider = provider else {
-            debugLog("[IdeviceGateway] error: TCP Provider was nil")
-            throw IdeviceGatewayError(.connectionFailed, reason: "TCP Provider was nil")
-        }
-        var providerToFree: OpaquePointer? = provider
-        defer {
-            if let ptr = providerToFree {
-                idevice_provider_free(ptr)
-            }
-        }
 
-        var client: OpaquePointer? = nil
-        let connectErr = connect(provider, &client)
-        if let connectErr = connectErr {
-            providerToFree = nil
-            let msg = self.getErrorMessage(from: connectErr)
-            debugLog("[IdeviceGateway] error: \(serviceName) connect failed: code=\(connectErr.pointee.code), message=\(msg)")
-            defer { safeFreeError(connectErr) }
-            throw IdeviceGatewayError(.serviceError, reason: "Failed to connect to \(serviceName), error: (\(msg))")
-        }
-        guard let client = client else {
-            throw IdeviceGatewayError(.noConnection)
-        }
-        defer { cleanup(client) }
-
-        return try action(client)
+        throw lastAttemptError ?? IdeviceGatewayError(.serviceError, reason: "Failed to connect to \(serviceName)")
     }
 
     private func performWithEitherService<T>(
@@ -950,7 +1040,13 @@ public final class IdeviceGateway: BaseDeviceGateway, DeviceGatewayAPI, @uncheck
         if pairingFileType == .rppairing || usesCoreDevice {
             return try performWithService(connect: connectRP, cleanup: cleanup, serviceName: serviceName, action: action)
         } else {
-            return try performWithTcpService(connect: connectLockdown, cleanup: cleanup, serviceName: serviceName, action: action)
+            do {
+                return try performWithTcpService(connect: connectLockdown, cleanup: cleanup, serviceName: serviceName, action: action)
+            } catch let gwErr as IdeviceGatewayError where pairingFileType == .lockdown && supportsCoreDeviceTransport && isTransientServiceFailureMessage(gwErr.reason) {
+                debugLog("[SIDESTORE_COREDEVICE] Lockdown TCP service (\(serviceName)) failed (\(gwErr.reason)); falling back to CoreDevice RSD transport")
+                self.coreDeviceEnabled = true
+                return try performWithService(connect: connectRP, cleanup: cleanup, serviceName: serviceName, action: action)
+            }
         }
     }
 
@@ -977,7 +1073,7 @@ public final class IdeviceGateway: BaseDeviceGateway, DeviceGatewayAPI, @uncheck
             cleanup: lockdownd_client_free,
             serviceName: "lockdownd"
         ) { client in
-            if self.pairingFileType == .lockdown, let pairingFileData = self.pairingFileData {
+            if self.pairingFileType == .lockdown && !self.usesCoreDevice, let pairingFileData = self.pairingFileData {
                 var pf: OpaquePointer? = nil
                 let parseErr = pairingFileData.withUnsafeBytes { buf in
                     idevice_pairing_file_from_bytes(buf.baseAddress?.assumingMemoryBound(to: UInt8.self), UInt(pairingFileData.count), &pf)
@@ -1034,26 +1130,62 @@ public final class IdeviceGateway: BaseDeviceGateway, DeviceGatewayAPI, @uncheck
     }
 
     private func syncInstallProvisioningProfile(profile: Data) throws {
-        debugLog("[IdeviceGateway] installProvisioningProfile() called, profile length: \(profile.count)")
+        try syncInstallProvisioningProfiles(profiles: [profile])
+    }
+
+    private func syncInstallProvisioningProfiles(profiles: [Data]) throws {
+        guard !profiles.isEmpty else { return }
+        debugLog("[IdeviceGateway] installProvisioningProfiles() called, count: \(profiles.count)")
         try verifyInitialized()
-        try performWithEitherService(
-            connectRP: misagent_connect_rsd,
-            connectLockdown: misagent_connect,
-            cleanup: misagent_client_free,
-            serviceName: "misagent"
-        ) { client in
-            try profile.withUnsafeBytes { (buf: UnsafeRawBufferPointer) in
-                if let baseAddress = buf.baseAddress?.assumingMemoryBound(to: UInt8.self) {
-                    verboseLog("[IdeviceGateway] installProvisioningProfile() calling misagent_install")
-                    let installErr = misagent_install(client, baseAddress, profile.count)
-                    if let installErr = installErr {
-                        let msg = self.getErrorMessage(from: installErr)
-                        debugLog("[IdeviceGateway] installProvisioningProfile() misagent_install failed: \(msg)")
-                        defer { safeFreeError(installErr) }
-                        throw IdeviceGatewayError(.serviceError, reason: "Failed to install profile, error: (\(msg))")
+
+        var nextIndex = 0
+        do {
+            try performWithEitherService(
+                connectRP: misagent_connect_rsd,
+                connectLockdown: misagent_connect,
+                cleanup: misagent_client_free,
+                serviceName: "misagent"
+            ) { client in
+                while nextIndex < profiles.count {
+                    let profile = profiles[nextIndex]
+                    try profile.withUnsafeBytes { (buf: UnsafeRawBufferPointer) in
+                        if let baseAddress = buf.baseAddress?.assumingMemoryBound(to: UInt8.self) {
+                            verboseLog("[IdeviceGateway] installProvisioningProfiles() calling misagent_install (\(nextIndex + 1)/\(profiles.count), length: \(profile.count))")
+                            let installErr = misagent_install(client, baseAddress, profile.count)
+                            if let installErr = installErr {
+                                let msg = self.getErrorMessage(from: installErr)
+                                debugLog("[IdeviceGateway] installProvisioningProfiles() misagent_install failed: \(msg)")
+                                defer { safeFreeError(installErr) }
+                                throw IdeviceGatewayError(.serviceError, reason: "Failed to install profile, error: (\(msg))")
+                            }
+                            debugLog("[IdeviceGateway] installProvisioningProfiles() misagent_install succeeded (\(nextIndex + 1)/\(profiles.count))")
+                        }
                     }
-                    debugLog("[IdeviceGateway] installProvisioningProfile() misagent_install succeeded")
+                    nextIndex += 1
                 }
+            }
+        } catch let gwErr as IdeviceGatewayError where nextIndex < profiles.count && isTransientServiceFailureMessage(gwErr.reason) {
+            debugLog("[IdeviceGateway] installProvisioningProfiles() falling back to per-profile install from index \(nextIndex) after transient error: \(gwErr.reason)")
+            while nextIndex < profiles.count {
+                let profile = profiles[nextIndex]
+                try performWithEitherService(
+                    connectRP: misagent_connect_rsd,
+                    connectLockdown: misagent_connect,
+                    cleanup: misagent_client_free,
+                    serviceName: "misagent"
+                ) { client in
+                    try profile.withUnsafeBytes { (buf: UnsafeRawBufferPointer) in
+                        if let baseAddress = buf.baseAddress?.assumingMemoryBound(to: UInt8.self) {
+                            let installErr = misagent_install(client, baseAddress, profile.count)
+                            if let installErr = installErr {
+                                let msg = self.getErrorMessage(from: installErr)
+                                defer { safeFreeError(installErr) }
+                                throw IdeviceGatewayError(.serviceError, reason: "Failed to install profile, error: (\(msg))")
+                            }
+                        }
+                    }
+                }
+                nextIndex += 1
             }
         }
     }
@@ -2792,6 +2924,13 @@ extension IdeviceGateway {
         try await withFFIDispatch {
             defer { self.releaseTransportIfIdle() }
             return try self.syncInstallProvisioningProfile(profile: profile)
+        }
+    }
+
+    public func installProvisioningProfiles(profiles: [Data]) async throws {
+        try await withFFIDispatch {
+            defer { self.releaseTransportIfIdle() }
+            return try self.syncInstallProvisioningProfiles(profiles: profiles)
         }
     }
 
