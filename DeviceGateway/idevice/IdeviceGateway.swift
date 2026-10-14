@@ -1132,10 +1132,6 @@ public final class IdeviceGateway: BaseDeviceGateway, DeviceGatewayAPI, @uncheck
                 Thread.sleep(forTimeInterval: 0.15)
             }
 
-            if serviceName != "heartbeat" && serviceName != "lockdownd" {
-                ensureLockdownHeartbeatIfNeeded()
-            }
-
             var tempPairingFile: OpaquePointer? = nil
             let parseErr = pairingFileData.withUnsafeBytes { buf in
                 return idevice_pairing_file_from_bytes(buf.baseAddress?.assumingMemoryBound(to: UInt8.self), UInt(pairingFileData.count), &tempPairingFile)
@@ -1245,13 +1241,7 @@ public final class IdeviceGateway: BaseDeviceGateway, DeviceGatewayAPI, @uncheck
                 return try performWithTcpService(connect: connectLockdown, cleanup: cleanup, serviceName: serviceName, action: action)
             }
         } else {
-            do {
-                return try performWithTcpService(connect: connectLockdown, cleanup: cleanup, serviceName: serviceName, action: action)
-            } catch let gwErr as IdeviceGatewayError where pairingFileType == .lockdown && supportsCoreDeviceTransport && isTransientServiceFailureMessage(gwErr.reason) {
-                debugLog("[SIDESTORE_COREDEVICE] Lockdown TCP service (\(serviceName)) failed (\(gwErr.reason)); falling back to CoreDevice RSD transport")
-                self.coreDeviceEnabled = true
-                return try performWithService(connect: connectRP, cleanup: cleanup, serviceName: serviceName, action: action)
-            }
+            return try performWithTcpService(connect: connectLockdown, cleanup: cleanup, serviceName: serviceName, action: action)
         }
     }
 
