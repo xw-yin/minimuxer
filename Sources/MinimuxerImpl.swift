@@ -110,7 +110,7 @@ final internal class MinimuxerImpl: MinimuxerAPI {
     @discardableResult
     private func configureRefreshTransport() async -> RefreshTransportDecision {
         let modernOS: Bool
-        if #available(iOS 26.4, *) { modernOS = true } else { modernOS = false }
+        if #available(iOS 17.0, *) { modernOS = true } else { modernOS = false }
         let mode = await getConnectionMode()
         let utun = network.isUTunAvailable
         let ipsec = network.isIKEv2IPSecAvailable

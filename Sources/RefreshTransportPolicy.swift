@@ -32,13 +32,13 @@ public enum RefreshTransportPolicy {
             return .init(transport: .remotePairing, reason: "RemotePairing-only record; not CoreDevice proof")
         }
         if modernOS && coreDeviceSupported {
-            return .init(transport: .coreDevice, reason: "iOS>=26.4 local VPN with Lockdown record and patched CoreDevice backend; initialization pending")
+            return .init(transport: .coreDevice, reason: "iOS>=17.0 local VPN with Lockdown record and patched CoreDevice backend; initialization pending")
         }
         if ipsec {
             return .init(transport: .lockdownIPSec, reason: "Upstream Lockdown with utun and IPSec interfaces")
         }
         if !modernOS {
-            return .init(transport: .lockdownLegacy, reason: "Preserve upstream Lockdown below iOS26.4")
+            return .init(transport: .lockdownLegacy, reason: "Preserve upstream Lockdown below iOS17.0")
         }
         return .init(transport: .unavailable, reason: "Selected backend has no CoreDevice implementation and IPSec is absent")
     }
