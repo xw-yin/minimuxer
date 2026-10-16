@@ -28,15 +28,16 @@ public enum RefreshTransportPolicy {
         guard mode == .localVPN, utun else {
             return .init(transport: .unavailable, reason: "Local VPN requires a reachable utun route; IPSec alone is not an upstream local-VPN route")
         }
-        if pairing == .rppairing {
-            return .init(transport: .remotePairing, reason: "RemotePairing-only record; not CoreDevice proof")
-        }
-        if pairing == .lockdown {
+        if modernOS {
+            guard pairing == .rppairing else {
+                return .init(transport: .unavailable, reason: "iOS 17.0+ requires Remote Pairing (rppairing); Lockdown is not supported on iOS 17+")
+            }
+            return .init(transport: .remotePairing, reason: "RemotePairing over local VPN")
+        } else {
+            guard pairing == .lockdown else {
+                return .init(transport: .unavailable, reason: "iOS < 17 requires Lockdown pairing; Remote Pairing is only supported on iOS 17+")
+            }
             return .init(transport: .lockdownLegacy, reason: "Standard Lockdown over local VPN")
         }
-        if ipsec {
-            return .init(transport: .lockdownIPSec, reason: "Upstream Lockdown with utun and IPSec interfaces")
-        }
-        return .init(transport: .unavailable, reason: "Unsupported pairing protocol or transport configuration")
     }
 }

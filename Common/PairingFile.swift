@@ -125,17 +125,20 @@ public enum PairingFileParser {
         let hasRemoteRP = missingRemoteRP.isEmpty
         let hasLockdown = missingLockdown.isEmpty
 
-        if hasRemoteRP && hasLockdown {
-            // Composite records must use Lockdown/CoreDevice, not RemotePairing.
-            return .lockdown
-        }
-
-        if hasRemoteRP {
-            return .rppairing
-        }
-
-        if hasLockdown {
-            return .lockdown
+        if #available(iOS 17.0, *) {
+            if hasRemoteRP {
+                return .rppairing
+            }
+            if hasLockdown {
+                throw PairingError.invalidPlist("iOS 17.0+ requires a Remote Pairing file, but provided file only contains Lockdown credentials.")
+            }
+        } else {
+            if hasLockdown {
+                return .lockdown
+            }
+            if hasRemoteRP {
+                throw PairingError.invalidPlist("iOS < 17 requires a Lockdown pairing file, but provided file only contains Remote Pairing credentials.")
+            }
         }
 
         throw PairingError.invalidPlist(
